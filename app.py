@@ -5,7 +5,7 @@ from urllib.parse import urlencode
 
 import psycopg  # v3
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
@@ -19,10 +19,10 @@ DB_URL = os.getenv("DATABASE_URL")
 if not DB_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-# If using Neon pooled URL, add &channel_binding=prefer in the URL
+# If using Neon pooled URL, add &channel_binding=prefer to DATABASE_URL
 conn = psycopg.connect(DB_URL, autocommit=True)
 
-# Twilio (optional; SMS only sent if all three are set and a caregiver phone exists)
+# Twilio (optional)
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
 TWILIO_FROM = os.getenv("TWILIO_FROM")
@@ -36,6 +36,13 @@ def send_sms_safe(to: Optional[str], body: str) -> bool:
     except Exception as e:
         print(f"Twilio error: {e}")
         return False
+
+# Admin key for cron/sync protection
+CRON_KEY = os.getenv("CRON_KEY")
+
+def _check_admin_key(x_admin_key: str | None):
+    if CRON_KEY and x_admin_key != CRON_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 # Fitbit OAuth/API
 FITBIT_CLIENT_ID = os.getenv("FITBIT_CLIENT_ID")
@@ -97,7 +104,7 @@ def _ensure_fitbit_tokens(patient_id: str):
 # -----------------------
 # FastAPI
 # -----------------------
-app = FastAPI(title="Health Readmit API", version="0.3.0")
+app = FastAPI(title="Health Readmit API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -337,7 +344,12 @@ def _insert_or_update_vital(cur, patient_id: str, ts: datetime,
     """, (patient_id, ts, hr, steps))
 
 @app.get("/integrations/fitbit/sync")
-def fitbit_sync(patient_id: str):
+def fitbit_sync(
+    patient_id: str,
+    x_admin_key: str | None = Header(default=None)
+):
+    _check_admin_key(x_admin_key)
+
     fitbit_user_id, access = _ensure_fitbit_tokens(patient_id)
     headers = {"Authorization": f"Bearer {access}"}
 
@@ -388,3 +400,24 @@ def fitbit_sync(patient_id: str):
                     send_sms_safe(row[0], f"[ALERT] {msg}")
 
     return {"ok": True, "fitbit_user_id": fitbit_user_id, "records_processed": inserted}
+
+@app.get("/integrations/fitbit/sync_all")
+def fitbit_sync_all(
+    x_admin_key: str | None = Header(default=None)
+):
+    _check_admin_key(x_admin_key)
+
+    processed, failed = 0, []
+    with conn.cursor() as cur:
+        cur.execute("SELECT patient_id FROM fitbit_tokens")
+        ids = [str(r[0]) for r in cur.fetchall()]
+
+    for pid in ids:
+        try:
+            # call the internal function directly to reuse logic
+            fitbit_sync(pid, x_admin_key=x_admin_key)
+            processed += 1
+        except Exception as e:
+            failed.append({"patient_id": pid, "error": str(e)})
+
+    return {"ok": True, "processed": processed, "failed": failed}
