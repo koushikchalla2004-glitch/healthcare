@@ -633,7 +633,7 @@ def ack_med(med_id: str, body: MedAckIn):
 def meds_remind_now(x_admin_key: str | None = Header(default=None)):
     _check_admin_key(x_admin_key)
 
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(ZoneInfo("UTC"))
     window_minutes = 5  # align with cron frequency
     sent_total = 0
     created_total = 0
