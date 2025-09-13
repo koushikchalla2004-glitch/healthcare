@@ -1,8 +1,9 @@
-import os, base64, json, time, logging, re, io, mimetypes, csv
+import os, base64, json, time, logging, re, io, mimetypes, csv, math, pickle
 from datetime import datetime, date
 from typing import Optional, List
 from urllib.parse import urlencode
 
+import numpy as np
 import psycopg  # v3
 import requests
 from fastapi import FastAPI, HTTPException, Query, Header, UploadFile, File, Form
@@ -69,13 +70,10 @@ except Exception as e:
 # =========
 # FastAPI
 # =========
-app = FastAPI(title="Health Readmit API", version="1.2.0")
+app = FastAPI(title="Health Readmit API", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 # =======
@@ -87,7 +85,7 @@ class PatientIn(BaseModel):
     sex_at_birth: Optional[str] = None
     caregiver_phone: Optional[str] = None
     patient_phone: Optional[str] = None
-    timezone: Optional[str] = None  # default applied if None
+    timezone: Optional[str] = None
 
 class PatientPatch(BaseModel):
     caregiver_phone: Optional[str] = None
@@ -147,22 +145,15 @@ class MedAckIn(BaseModel):
 # Timezone helpers
 # =========
 TZ_FIXES = {
-    "America/Austin": "America/Chicago",
-    "Austin": "America/Chicago",
-    "CST": "America/Chicago",
-    "PST": "America/Los_Angeles",
-    "EST": "America/New_York",
-    "MST": "America/Denver",
-    "IST": "Asia/Kolkata",
-    "US/Central": "America/Chicago",
+    "America/Austin": "America/Chicago", "Austin": "America/Chicago",
+    "CST": "America/Chicago", "PST": "America/Los_Angeles", "EST": "America/New_York",
+    "MST": "America/Denver", "IST": "Asia/Kolkata", "US/Central": "America/Chicago",
 }
 def canonical_tz(tz: str | None) -> str:
-    if not tz:
-        return "America/Chicago"
+    if not tz: return "America/Chicago"
     t = TZ_FIXES.get(tz.strip(), tz.strip())
     try:
-        ZoneInfo(t)
-        return t
+        ZoneInfo(t); return t
     except ZoneInfoNotFoundError:
         logging.warning(f"Unknown timezone '{tz}', falling back to UTC")
         return "UTC"
@@ -187,8 +178,7 @@ def _insert_or_update_vital(cur, patient_id: str, ts: datetime,
     """, (patient_id, ts, hr, steps, spo2, sbp, dbp, temp_c))
 
 def _today_scheduled_utc(tz: str, times_local: List[str], on_date: date) -> List[datetime]:
-    z = ZoneInfo(canonical_tz(tz))
-    out = []
+    z = ZoneInfo(canonical_tz(tz)); out = []
     for t in times_local:
         try:
             hh, mm = [int(x) for x in t.split(":")[:2]]
@@ -203,8 +193,7 @@ def _send_med_sms(patient_id: str, msg: str) -> int:
     with conn.cursor() as cur:
         cur.execute("SELECT patient_phone, caregiver_phone FROM patients WHERE id=%s", (patient_id,))
         row = cur.fetchone()
-    if not row:
-        return 0
+    if not row: return 0
     patient_phone, caregiver_phone = row
     body = f"{msg} Reply STOP to opt out, HELP for help."
     if patient_phone and send_sms_safe(patient_phone, body): sent += 1
@@ -212,12 +201,9 @@ def _send_med_sms(patient_id: str, msg: str) -> int:
     return sent
 
 def as_native_json(v):
-    if isinstance(v, (list, dict)) or v is None:
-        return v
-    try:
-        return json.loads(v)
-    except Exception:
-        return v
+    if isinstance(v, (list, dict)) or v is None: return v
+    try: return json.loads(v)
+    except Exception: return v
 
 def _normalize_times(times: Optional[List[str]], freq: str) -> List[str]:
     cand = times if isinstance(times, list) else None
@@ -264,8 +250,7 @@ def _parse_text_for_dx(text: str) -> List[str]:
     return sorted(set(ICD10_RE.findall(text or "")))
 
 def _infer_times_from_sig(sig: str | None, freq_fallback: str = "daily") -> List[str] | None:
-    if not sig:
-        return None
+    if not sig: return None
     s = sig.lower().strip()
 
     tmatches = re.findall(r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b', s)
@@ -277,8 +262,7 @@ def _infer_times_from_sig(sig: str | None, freq_fallback: str = "daily") -> List
             if ap.lower() == "am" and h == 12: h = 0
         if 0 <= h <= 23 and 0 <= m <= 59:
             times.append(f"{h:02d}:{m:02d}")
-    if times:
-        return sorted(list(set(times)))
+    if times: return sorted(list(set(times)))
 
     m = re.search(r'\b([01])\s*-\s*([01])\s*-\s*([01])\b', s)
     if m:
@@ -315,11 +299,9 @@ def _extract_meds_unstructured(text: str) -> List[dict]:
     meds = []
     for raw in text.splitlines():
         line = raw.strip()
-        if not line or len(line) < 3:
-            continue
+        if not line or len(line) < 3: continue
         m = MED_LINE.match(line)
-        if not m:
-            continue
+        if not m: continue
         name = re.sub(r'\s+', ' ', m.group("name")).strip(" -")
         dose = (m.group("dose") or "").strip()
         route = (m.group("route") or "").lower()
@@ -333,10 +315,9 @@ def _extract_meds_unstructured(text: str) -> List[dict]:
     return meds
 
 # =========
-# OCR/Plain-text reader for uploads
+# OCR/Plain-text reader
 # =========
 def _read_text_from_upload(file: UploadFile) -> str:
-    """If DocAI configured and file is image/pdf, OCR it; else decode as text."""
     data = file.file.read()
     ctype = file.content_type or mimetypes.guess_type(file.filename or "")[0] or ""
     is_scan = ("pdf" in ctype) or ("image" in ctype) or ctype == ""
@@ -349,7 +330,6 @@ def _read_text_from_upload(file: UploadFile) -> str:
             return result.document.text or ""
         except Exception as e:
             logging.warning(f"DocAI processing failed; falling back to text decode: {e}")
-    # Fallback: assume text
     try:
         return data.decode("utf-8", errors="ignore")
     except Exception:
@@ -362,8 +342,7 @@ def _read_text_from_upload(file: UploadFile) -> str:
 def healthz():
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1;")
-            cur.fetchone()
+            cur.execute("SELECT 1;"); cur.fetchone()
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB health check failed: {e}")
@@ -386,18 +365,13 @@ def create_patient(p: PatientIn):
 def get_patient(patient_id: str):
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, name, dob, sex_at_birth, caregiver_phone, patient_phone, timezone
-                FROM patients WHERE id=%s
-            """, (patient_id,))
+            cur.execute("""SELECT id, name, dob, sex_at_birth, caregiver_phone, patient_phone, timezone
+                           FROM patients WHERE id=%s""", (patient_id,))
             r = cur.fetchone()
-        if not r:
-            raise HTTPException(status_code=404, detail="Patient not found")
-        return {
-            "id": str(r[0]), "name": r[1], "dob": r[2].isoformat(),
-            "sex_at_birth": r[3], "caregiver_phone": r[4],
-            "patient_phone": r[5], "timezone": r[6]
-        }
+        if not r: raise HTTPException(status_code=404, detail="Patient not found")
+        return {"id": str(r[0]), "name": r[1], "dob": r[2].isoformat(),
+                "sex_at_birth": r[3], "caregiver_phone": r[4],
+                "patient_phone": r[5], "timezone": r[6]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
@@ -405,14 +379,10 @@ def get_patient(patient_id: str):
 def patch_patient(patient_id: str, body: PatientPatch):
     try:
         fields, vals = [], []
-        if body.caregiver_phone is not None:
-            fields.append("caregiver_phone=%s"); vals.append(body.caregiver_phone)
-        if body.patient_phone is not None:
-            fields.append("patient_phone=%s"); vals.append(body.patient_phone)
-        if body.timezone is not None:
-            fields.append("timezone=%s"); vals.append(canonical_tz(body.timezone))
-        if not fields:
-            return {"ok": True, "updated": 0}
+        if body.caregiver_phone is not None: fields.append("caregiver_phone=%s"); vals.append(body.caregiver_phone)
+        if body.patient_phone is not None:   fields.append("patient_phone=%s");   vals.append(body.patient_phone)
+        if body.timezone is not None:        fields.append("timezone=%s");        vals.append(canonical_tz(body.timezone))
+        if not fields: return {"ok": True, "updated": 0}
         vals.append(patient_id)
         with conn.cursor() as cur:
             cur.execute(f"UPDATE patients SET {', '.join(fields)} WHERE id=%s", vals)
@@ -427,8 +397,7 @@ def link_source(patient_id: str, body: SourceLink):
             cur.execute("""
                 INSERT INTO patient_sources (patient_id, provider, external_user_id)
                 VALUES (%s,%s,%s)
-                ON CONFLICT (provider, external_user_id)
-                DO UPDATE SET patient_id = EXCLUDED.patient_id
+                ON CONFLICT (provider, external_user_id) DO UPDATE SET patient_id=EXCLUDED.patient_id
             """, (patient_id, body.provider, body.external_user_id))
         return {"ok": True}
     except Exception as e:
@@ -442,8 +411,7 @@ def ingest_vitals(batch: VitalsBatch):
         if s.hr is not None and (s.hr < 25 or s.hr > 220): continue
         if s.spo2 is not None and (s.spo2 < 50 or s.spo2 > 100): continue
         clean.append(s)
-    if not clean:
-        raise HTTPException(status_code=400, detail="No valid samples")
+    if not clean: raise HTTPException(status_code=400, detail="No valid samples")
 
     try:
         with conn.cursor() as cur:
@@ -460,25 +428,19 @@ def ingest_vitals(batch: VitalsBatch):
             r = cur.fetchone()
             if r: caregiver_phone = r[0]
 
-            last = clean[-1]
-            candidates = []
+            last = clean[-1]; candidates = []
             if last.spo2 is not None and last.spo2 < 90:
                 candidates.append(("SPO2_LOW", "HIGH", f"SpO2 {last.spo2}% below 90 at {last.ts.isoformat()}"))
             if last.hr is not None and (last.hr < 40 or last.hr > 135):
                 candidates.append(("HR_ABNORMAL", "HIGH", f"HR {last.hr} abnormal at {last.ts.isoformat()}"))
 
             for t, se, msg in candidates:
-                cur.execute("""
-                    SELECT COUNT(*) FROM alerts
-                    WHERE patient_id=%s AND type=%s
-                      AND created_at > now() - interval '15 minutes'
-                """, (batch.patient_id, t))
+                cur.execute("""SELECT COUNT(*) FROM alerts
+                               WHERE patient_id=%s AND type=%s AND created_at > now()-interval '15 minutes'""",
+                            (batch.patient_id, t))
                 recent = cur.fetchone()[0] > 0
-
-                cur.execute("""
-                    INSERT INTO alerts (patient_id, type, severity, message)
-                    VALUES (%s,%s,%s,%s)
-                """, (batch.patient_id, t, se, msg))
+                cur.execute("""INSERT INTO alerts (patient_id, type, severity, message)
+                               VALUES (%s,%s,%s,%s)""", (batch.patient_id, t, se, msg))
                 if se == "HIGH" and not recent and caregiver_phone:
                     send_sms_safe(caregiver_phone, f"[ALERT] {msg}")
 
@@ -490,11 +452,9 @@ def ingest_vitals(batch: VitalsBatch):
 def create_alert(a: AlertIn):
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO alerts (patient_id, type, severity, message)
-                VALUES (%s,%s,%s,%s)
-                RETURNING id, created_at
-            """, (a.patient_id, a.type, a.severity, a.message))
+            cur.execute("""INSERT INTO alerts (patient_id, type, severity, message)
+                           VALUES (%s,%s,%s,%s) RETURNING id, created_at""",
+                        (a.patient_id, a.type, a.severity, a.message))
             rid, ts = cur.fetchone()
         return {"ok": True, "id": str(rid), "created_at": ts.isoformat()}
     except Exception as e:
@@ -504,16 +464,11 @@ def create_alert(a: AlertIn):
 def list_alerts(patient_id: str):
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, type, severity, message, created_at, status
-                FROM alerts WHERE patient_id=%s
-                ORDER BY created_at DESC LIMIT 50
-            """, (patient_id,))
+            cur.execute("""SELECT id, type, severity, message, created_at, status
+                           FROM alerts WHERE patient_id=%s ORDER BY created_at DESC LIMIT 50""", (patient_id,))
             rows = cur.fetchall()
-        return [{
-            "id": str(r[0]), "type": r[1], "severity": r[2], "message": r[3],
-            "created_at": r[4].isoformat(), "status": r[5]
-        } for r in rows]
+        return [{"id": str(r[0]), "type": r[1], "severity": r[2], "message": r[3],
+                 "created_at": r[4].isoformat(), "status": r[5]} for r in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
@@ -552,22 +507,20 @@ def fitbit_callback(code: str, state: str):
     expires_at = int(time.time()) + int(tok.get("expires_in", 28800))
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO fitbit_tokens (patient_id, fitbit_user_id, access_token, refresh_token, expires_at, scope, token_type)
-                VALUES (%s,%s,%s,%s, TO_TIMESTAMP(%s), %s, %s)
-                ON CONFLICT (patient_id) DO UPDATE
-                  SET fitbit_user_id=EXCLUDED.fitbit_user_id,
-                      access_token=EXCLUDED.access_token,
-                      refresh_token=EXCLUDED.refresh_token,
-                      expires_at=EXCLUDED.expires_at,
-                      scope=EXCLUDED.scope,
-                      token_type=EXCLUDED.token_type
-            """, (state, fitbit_user_id, access, refresh, expires_at, tok.get("scope"), tok.get("token_type")))
-            cur.execute("""
-                INSERT INTO patient_sources (patient_id, provider, external_user_id)
-                VALUES (%s,'fitbit',%s)
-                ON CONFLICT (provider, external_user_id) DO UPDATE SET patient_id=EXCLUDED.patient_id
-            """, (state, fitbit_user_id))
+            cur.execute("""INSERT INTO fitbit_tokens (patient_id, fitbit_user_id, access_token, refresh_token, expires_at, scope, token_type)
+                           VALUES (%s,%s,%s,%s, TO_TIMESTAMP(%s), %s, %s)
+                           ON CONFLICT (patient_id) DO UPDATE
+                           SET fitbit_user_id=EXCLUDED.fitbit_user_id,
+                               access_token=EXCLUDED.access_token,
+                               refresh_token=EXCLUDED.refresh_token,
+                               expires_at=EXCLUDED.expires_at,
+                               scope=EXCLUDED.scope,
+                               token_type=EXCLUDED.token_type
+                        """, (state, fitbit_user_id, access, refresh, expires_at, tok.get("scope"), tok.get("token_type")))
+            cur.execute("""INSERT INTO patient_sources (patient_id, provider, external_user_id)
+                           VALUES (%s,'fitbit',%s)
+                           ON CONFLICT (provider, external_user_id) DO UPDATE SET patient_id=EXCLUDED.patient_id
+                        """, (state, fitbit_user_id))
         return {"ok": True, "linked": True, "patient_id": state, "fitbit_user_id": fitbit_user_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
@@ -580,9 +533,7 @@ def _ensure_fitbit_tokens(patient_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Fitbit not linked for this patient")
     user_id, access, refresh, exp = row
-    if time.time() < float(exp) - 120:
-        return user_id, access
-    # refresh
+    if time.time() < float(exp) - 120: return user_id, access
     r = requests.post("https://api.fitbit.com/oauth2/token",
                       data={"grant_type":"refresh_token","refresh_token":refresh},
                       headers={"Authorization": "Basic " + base64.b64encode(
@@ -594,8 +545,9 @@ def _ensure_fitbit_tokens(patient_id: str):
     access = tok["access_token"]; refresh = tok["refresh_token"]
     expires_at = int(time.time()) + int(tok.get("expires_in", 28800))
     with conn.cursor() as cur:
-        cur.execute("""UPDATE fitbit_tokens SET access_token=%s, refresh_token=%s, expires_at=TO_TIMESTAMP(%s),
-                       scope=%s, token_type=%s WHERE patient_id=%s""",
+        cur.execute("""UPDATE fitbit_tokens
+                       SET access_token=%s, refresh_token=%s, expires_at=TO_TIMESTAMP(%s),
+                           scope=%s, token_type=%s WHERE patient_id=%s""",
                     (access, refresh, expires_at, tok.get("scope"), tok.get("token_type"), patient_id))
     return user_id, access
 
@@ -627,15 +579,14 @@ def fitbit_sync(patient_id: str, x_admin_key: str | None = Header(default=None))
         if last_hr is not None and (last_hr < 40 or last_hr > 135):
             msg = f"HR {last_hr} abnormal (Fitbit sync)"
             cur.execute("""SELECT COUNT(*) FROM alerts WHERE patient_id=%s AND type='HR_ABNORMAL'
-                           AND created_at > now() - interval '15 minutes'""", (patient_id,))
+                           AND created_at > now()-interval '15 minutes'""", (patient_id,))
             recent = cur.fetchone()[0] > 0
             cur.execute("""INSERT INTO alerts (patient_id, type, severity, message)
                            VALUES (%s,'HR_ABNORMAL','HIGH',%s)""", (patient_id, msg))
             if not recent:
                 cur.execute("SELECT caregiver_phone FROM patients WHERE id=%s", (patient_id,))
                 row = cur.fetchone()
-                if row and row[0]:
-                    send_sms_safe(row[0], f"[ALERT] {msg}")
+                if row and row[0]: send_sms_safe(row[0], f"[ALERT] {msg}")
     return {"ok": True, "fitbit_user_id": fitbit_user_id, "records_processed": inserted}
 
 @app.get("/integrations/fitbit/sync_all")
@@ -646,10 +597,8 @@ def fitbit_sync_all(x_admin_key: str | None = Header(default=None)):
         cur.execute("SELECT patient_id FROM fitbit_tokens")
         ids = [str(r[0]) for r in cur.fetchall()]
     for pid in ids:
-        try:
-            fitbit_sync(pid, x_admin_key=x_admin_key); processed += 1
-        except Exception as e:
-            failed.append({"patient_id": pid, "error": str(e)})
+        try: fitbit_sync(pid, x_admin_key=x_admin_key); processed += 1
+        except Exception as e: failed.append({"patient_id": pid, "error": str(e)})
     logging.info(f"[sync_all] processed={processed} failed={len(failed)}")
     return {"ok": True, "processed": processed, "failed": failed}
 
@@ -660,11 +609,11 @@ def create_med(m: MedicationIn):
         tz = canonical_tz(m.timezone or _patient_timezone(m.patient_id))
         times = _normalize_times(m.times_local, m.freq)
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO medications
-                (patient_id, drug_name, dose, freq, times_local, timezone, start_date, end_date, is_critical)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
-            """, (m.patient_id, m.drug_name, m.dose, m.freq, json.dumps(times), tz, m.start_date, m.end_date, m.is_critical))
+            cur.execute("""INSERT INTO medications
+                           (patient_id, drug_name, dose, freq, times_local, timezone, start_date, end_date, is_critical)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                        (m.patient_id, m.drug_name, m.dose, m.freq, json.dumps(times), tz,
+                         m.start_date, m.end_date, m.is_critical))
             (mid,) = cur.fetchone()
         return {"ok": True, "medication_id": str(mid), "times_local": times, "timezone": tz}
     except Exception as e:
@@ -674,17 +623,13 @@ def create_med(m: MedicationIn):
 def list_meds(patient_id: str):
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, drug_name, dose, freq, times_local, timezone, start_date, end_date, is_critical
-                FROM medications WHERE patient_id=%s ORDER BY created_at DESC
-            """, (patient_id,))
+            cur.execute("""SELECT id, drug_name, dose, freq, times_local, timezone, start_date, end_date, is_critical
+                           FROM medications WHERE patient_id=%s ORDER BY created_at DESC""", (patient_id,))
             rows = cur.fetchall()
-        return [{
-            "id": str(r[0]), "drug_name": r[1], "dose": r[2], "freq": r[3],
-            "times_local": as_native_json(r[4]), "timezone": r[5],
-            "start_date": r[6].isoformat(), "end_date": r[7].isoformat() if r[7] else None,
-            "is_critical": r[8]
-        } for r in rows]
+        return [{"id": str(r[0]), "drug_name": r[1], "dose": r[2], "freq": r[3],
+                 "times_local": as_native_json(r[4]), "timezone": r[5],
+                 "start_date": r[6].isoformat(), "end_date": r[7].isoformat() if r[7] else None,
+                 "is_critical": r[8]} for r in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
@@ -720,18 +665,17 @@ def ack_med(med_id: str, body: MedAckIn):
 def list_adherence(patient_id: str, limit: int = 50):
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT ma.id, ma.medication_id, ma.scheduled_time, ma.taken, ma.taken_time, ma.source,
-                       m.drug_name, m.dose
-                FROM med_adherence ma JOIN medications m ON m.id = ma.medication_id
-                WHERE m.patient_id=%s ORDER BY ma.scheduled_time DESC LIMIT %s
-            """, (patient_id, limit))
+            cur.execute("""SELECT ma.id, ma.medication_id, ma.scheduled_time, ma.taken, ma.taken_time, ma.source,
+                                  m.drug_name, m.dose
+                           FROM med_adherence ma
+                           JOIN medications m ON m.id=ma.medication_id
+                           WHERE m.patient_id=%s
+                           ORDER BY ma.scheduled_time DESC
+                           LIMIT %s""", (patient_id, limit))
             rows = cur.fetchall()
-        return [{
-            "id": str(r[0]), "medication_id": str(r[1]), "scheduled_time": r[2].isoformat(),
-            "taken": r[3], "taken_time": r[4].isoformat() if r[4] else None,
-            "source": r[5], "drug_name": r[6], "dose": r[7]
-        } for r in rows]
+        return [{"id": str(r[0]), "medication_id": str(r[1]), "scheduled_time": r[2].isoformat(),
+                 "taken": r[3], "taken_time": r[4].isoformat() if r[4] else None,
+                 "source": r[5], "drug_name": r[6], "dose": r[7]} for r in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
@@ -742,11 +686,9 @@ def meds_remind_now(x_admin_key: str | None = Header(default=None),
     now_utc = datetime.now(ZoneInfo("UTC"))
     sent_total = 0; created_total = 0
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, patient_id, times_local, timezone, start_date, end_date
-            FROM medications
-            WHERE start_date <= CURRENT_DATE AND (end_date IS NULL OR end_date >= CURRENT_DATE)
-        """)
+        cur.execute("""SELECT id, patient_id, times_local, timezone, start_date, end_date
+                       FROM medications
+                       WHERE start_date <= CURRENT_DATE AND (end_date IS NULL OR end_date >= CURRENT_DATE)""")
         meds = cur.fetchall()
         for mid, pid, times_json, tz, sdate, edate in meds:
             times = as_native_json(times_json) or []
@@ -756,12 +698,10 @@ def meds_remind_now(x_admin_key: str | None = Header(default=None),
             for sched_utc in _today_scheduled_utc(tz_can, times, local_today):
                 delta = abs((now_utc - sched_utc).total_seconds())/60.0
                 if delta <= window:
-                    cur.execute("""
-                        INSERT INTO med_adherence (medication_id, scheduled_time, taken)
-                        VALUES (%s,%s,false)
-                        ON CONFLICT (medication_id, scheduled_time) DO NOTHING
-                        RETURNING id
-                    """, (mid, sched_utc))
+                    cur.execute("""INSERT INTO med_adherence (medication_id, scheduled_time, taken)
+                                   VALUES (%s,%s,false)
+                                   ON CONFLICT (medication_id, scheduled_time) DO NOTHING
+                                   RETURNING id""", (mid, sched_utc))
                     ins = cur.fetchone()
                     if ins:
                         created_total += 1
@@ -793,19 +733,16 @@ def meds_escalate_missed(x_admin_key: str | None = Header(default=None)):
             sev = "HIGH" if is_critical else "MEDIUM"
             msg = f"Missed medication dose scheduled at {sched.isoformat()}."
             cur.execute("""INSERT INTO alerts (patient_id, type, severity, message)
-                           VALUES (%s,'MISSED_DOSE',%s,%s)""",
-                        (pid, sev, msg))
+                           VALUES (%s,'MISSED_DOSE',%s,%s)""", (pid, sev, msg))
             escalations += 1
             sms_sent += _send_med_sms(pid, "Missed dose: please check in. Scheduled at local time.")
     logging.info(f"[escalate_missed] escalations={escalations} sms_sent={sms_sent}")
     return {"ok": True, "escalations": escalations, "sms_sent": sms_sent}
 
-# ===== Unstructured uploads with OCR support =====
+# ===== Unstructured uploads (OCR or plain text) =====
 def _read_plain_or_ocr(file: UploadFile) -> str:
-    """Wrapper for endpoints: reads entire file once and routes to OCR or text."""
     return _read_text_from_upload(file)
 
-# Discharge summary → diagnoses (ICD-10)
 @app.post("/v1/docs/discharge_text")
 async def upload_discharge_text(patient_id: str = Form(...),
                                 file: UploadFile | None = File(None),
@@ -816,7 +753,6 @@ async def upload_discharge_text(patient_id: str = Form(...),
         raw_text = _read_plain_or_ocr(file)
     else:
         raise HTTPException(status_code=400, detail="Provide a .txt/.pdf/image file or 'text' form field.")
-
     try:
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO documents (patient_id, filename, content_type, status)
@@ -826,21 +762,18 @@ async def upload_discharge_text(patient_id: str = Form(...),
             (doc_id,) = cur.fetchone()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error creating doc: {e}")
-
     dx_codes = _parse_text_for_dx(raw_text)
     dx_created = 0
     try:
         with conn.cursor() as cur:
             for code in dx_codes:
                 cur.execute("""INSERT INTO diagnoses (patient_id, source_document_id, icd10, description)
-                               VALUES (%s,%s,%s,NULL)""",
-                            (patient_id, doc_id, code))
+                               VALUES (%s,%s,%s,NULL)""", (patient_id, doc_id, code))
                 dx_created += 1
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error saving diagnoses: {e}")
     return {"ok": True, "document_id": str(doc_id), "diagnoses_created": dx_created}
 
-# Pharmacy sheet → medications (unstructured text or scan)
 @app.post("/v1/docs/meds_text")
 async def upload_meds_text(patient_id: str = Form(...),
                            file: UploadFile | None = File(None),
@@ -851,13 +784,10 @@ async def upload_meds_text(patient_id: str = Form(...),
         raw_text = _read_plain_or_ocr(file)
     else:
         raise HTTPException(status_code=400, detail="Provide a .txt/.pdf/image file or 'text' form field.")
-
     meds = _extract_meds_unstructured(raw_text)
     if not meds:
         return {"ok": True, "medications_created": 0, "note": "No medication patterns recognized."}
-
-    tz = _patient_timezone(patient_id)
-    created = 0
+    tz = _patient_timezone(patient_id); created = 0
     try:
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO documents (patient_id, filename, content_type, status)
@@ -865,17 +795,133 @@ async def upload_meds_text(patient_id: str = Form(...),
                         (patient_id, (file.filename if file else "pharmacy_text.txt"),
                          (file.content_type if file else "text/plain")))
             (doc_id,) = cur.fetchone()
-
             for m in meds[:25]:
                 inferred = _infer_times_from_sig(m["sig"], m["freq"])
                 times = inferred or _normalize_times(None, m["freq"])
-                cur.execute("""
-                    INSERT INTO medications
-                    (patient_id, drug_name, dose, freq, times_local, timezone, start_date, end_date, is_critical)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (patient_id, m["drug_name"], m["dose"], m["freq"],
-                      json.dumps(times), tz, date.today(), None, False))
+                cur.execute("""INSERT INTO medications
+                               (patient_id, drug_name, dose, freq, times_local, timezone, start_date, end_date, is_critical)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                            (patient_id, m["drug_name"], m["dose"], m["freq"],
+                             json.dumps(times), tz, date.today(), None, False))
                 created += 1
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Text/OCR ingest error: {e}")
     return {"ok": True, "medications_created": created}
+
+# ===== Readmission Risk (heuristic now; pluggable sklearn) =====
+RISK_MODEL_B64 = os.getenv("RISK_MODEL_B64")      # optional: base64 of sklearn model.pkl
+RISK_MODEL_VERSION = os.getenv("RISK_MODEL_VERSION", "heuristic_v1")
+_MODEL = None
+_MODEL_FEATURES = [
+    "age","spo2_min_7d","hr_max_7d","hr_mean_7d","steps_mean_7d",
+    "alerts_7d","adherence_7d","num_meds_active","dx_count"
+]
+
+def _load_risk_model():
+    global _MODEL
+    if _MODEL is not None: return _MODEL
+    if RISK_MODEL_B64:
+        try:
+            _MODEL = pickle.loads(base64.b64decode(RISK_MODEL_B64))
+            logging.info("Risk model loaded from RISK_MODEL_B64")
+        except Exception as e:
+            logging.warning(f"Failed to load RISK_MODEL_B64, using heuristic: {e}")
+            _MODEL = None
+    return _MODEL
+
+def _get_patient_features(patient_id: str) -> dict:
+    feats = {"age":0,"spo2_min_7d":99,"hr_max_7d":70,"hr_mean_7d":70,
+             "steps_mean_7d":0,"alerts_7d":0,"adherence_7d":1.0,
+             "num_meds_active":0,"dx_count":0}
+    with conn.cursor() as cur:
+        cur.execute("SELECT dob FROM patients WHERE id=%s",(patient_id,))
+        row = cur.fetchone()
+        if row and row[0]:
+            dob = row[0]; today = datetime.utcnow().date()
+            feats["age"] = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+        cur.execute("""
+            SELECT COALESCE(MIN(spo2),99), COALESCE(MAX(hr),0),
+                   COALESCE(AVG(hr),70), COALESCE(AVG(steps),0)
+            FROM vitals WHERE patient_id=%s AND ts > now()-interval '7 days'
+        """,(patient_id,))
+        v = cur.fetchone() or (99,0,70,0)
+        feats["spo2_min_7d"], feats["hr_max_7d"], feats["hr_mean_7d"], feats["steps_mean_7d"] = v
+        cur.execute("SELECT COUNT(*) FROM alerts WHERE patient_id=%s AND created_at > now()-interval '7 days'",(patient_id,))
+        feats["alerts_7d"] = int(cur.fetchone()[0])
+        cur.execute("""
+            SELECT COUNT(*) FROM medications
+            WHERE patient_id=%s AND start_date<=CURRENT_DATE
+              AND (end_date IS NULL OR end_date>=CURRENT_DATE)
+        """,(patient_id,))
+        feats["num_meds_active"] = int(cur.fetchone()[0])
+        cur.execute("""
+            SELECT COALESCE(SUM(CASE WHEN taken THEN 1 ELSE 0 END),0),
+                   COALESCE(COUNT(*),0)
+            FROM med_adherence ma
+            JOIN medications m ON m.id=ma.medication_id
+            WHERE m.patient_id=%s AND ma.scheduled_time > now()-interval '7 days'
+        """,(patient_id,))
+        taken_cnt, total_cnt = cur.fetchone()
+        feats["adherence_7d"] = 1.0 if total_cnt==0 else float(taken_cnt)/float(total_cnt)
+        cur.execute("SELECT COUNT(*) FROM diagnoses WHERE patient_id=%s",(patient_id,))
+        feats["dx_count"] = int(cur.fetchone()[0])
+    feats["spo2_min_7d"] = max(50,min(100,float(feats["spo2_min_7d"])))
+    feats["hr_max_7d"]    = max(30,min(220,float(feats["hr_max_7d"])))
+    feats["hr_mean_7d"]   = max(30,min(220,float(feats["hr_mean_7d"])))
+    feats["steps_mean_7d"]= max(0,float(feats["steps_mean_7d"]))
+    feats["adherence_7d"] = max(0.0,min(1.0,float(feats["adherence_7d"])))
+    return feats
+
+def _heuristic_risk(feats: dict) -> tuple[float, dict]:
+    w = {}
+    w["spo2_min_7d"]    = 0.35 * max(0.0, (92.0 - feats["spo2_min_7d"]) / 10.0)
+    w["hr_max_7d"]      = 0.20 * (1.0 if feats["hr_max_7d"] >= 130 else 0.0)
+    w["alerts_7d"]      = 0.15 * min(1.0, feats["alerts_7d"] / 3.0)
+    w["adherence_7d"]   = 0.15 * (1.0 - feats["adherence_7d"])
+    w["num_meds_active"]= 0.10 * min(1.0, feats["num_meds_active"] / 8.0)
+    w["age"]            = 0.05 * (1.0 if feats["age"] >= 75 else 0.0)
+    score = max(0.0, min(1.0, sum(w.values())))
+    return score, w
+
+@app.get("/v1/risk")
+def risk_score(patient_id: str, store: bool = True):
+    feats = _get_patient_features(patient_id)
+    model = _load_risk_model()
+    if model is not None:
+        x = np.array([[feats.get(k,0.0) for k in _MODEL_FEATURES]], dtype=float)
+        try:
+            prob = float(model.predict_proba(x)[:,1][0])
+        except Exception:
+            z = float(model.decision_function(x)[0])
+            prob = 1.0/(1.0+math.exp(-z))
+        score = max(0.0, min(1.0, prob))
+        factors = {k: float(feats[k]) for k in _MODEL_FEATURES}
+        model_ver = os.getenv("RISK_MODEL_VERSION", "sklearn_v1")
+    else:
+        score, factors = _heuristic_risk(feats)
+        model_ver = "heuristic_v1"
+    bucket = "low" if score < 0.33 else ("medium" if score < 0.66 else "high")
+    if store:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO risk_scores (patient_id, model_version, score, bucket, factors)
+                               VALUES (%s,%s,%s,%s,%s)""",
+                            (patient_id, model_ver, score, bucket, json.dumps(factors)))
+        except Exception as e:
+            logging.warning(f"Failed to store risk score: {e}")
+    return {"patient_id": patient_id, "model_version": model_ver,
+            "score": round(score,3), "bucket": bucket, "factors": factors}
+
+@app.get("/cron/risk/recompute_all")
+def risk_recompute_all(x_admin_key: str | None = Header(default=None)):
+    _check_admin_key(x_admin_key)
+    processed = 0
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM patients")
+        pids = [str(r[0]) for r in cur.fetchall()]
+    for pid in pids:
+        try:
+            risk_score(pid, store=True); processed += 1
+        except Exception as e:
+            logging.warning(f"Risk recompute failed for {pid}: {e}")
+    return {"ok": True, "processed": processed}
