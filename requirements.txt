@@ -7,3 +7,5 @@ twilio==9.2.3
 python-dotenv==1.0.1
 python-multipart==0.0.9
 google-cloud-documentai
+scikit-learn==1.5.1
+numpy==1.26.4
