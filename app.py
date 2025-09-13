@@ -113,7 +113,7 @@ def _ensure_fitbit_tokens(patient_id: str):
 # =========
 # FastAPI
 # =========
-app = FastAPI(title="Health Readmit API", version="0.6.0")
+app = FastAPI(title="Health Readmit API", version="0.6.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
@@ -213,6 +213,15 @@ def _send_med_sms(patient_id: str, msg: str) -> int:
     if patient_phone and send_sms_safe(patient_phone, body): sent += 1
     if caregiver_phone and send_sms_safe(caregiver_phone, f"CarePulse: {msg}"): sent += 1
     return sent
+
+def as_native_json(v):
+    """DB JSONB arrives as list/dict via psycopg3; if str, json.loads it; else return as-is."""
+    if isinstance(v, (list, dict)) or v is None:
+        return v
+    try:
+        return json.loads(v)
+    except Exception:
+        return v
 
 
 # =======
@@ -526,7 +535,7 @@ def list_meds(patient_id: str):
                 "drug_name": r[1],
                 "dose": r[2],
                 "freq": r[3],
-                "times_local": json.loads(r[4]),
+                "times_local": as_native_json(r[4]),  # <-- fixed
                 "timezone": r[5],
                 "start_date": r[6].isoformat(),
                 "end_date": r[7].isoformat() if r[7] else None,
@@ -593,7 +602,9 @@ def meds_remind_now(x_admin_key: str | None = Header(default=None)):
         meds = cur.fetchall()
 
         for mid, pid, times_json, tz, sdate, edate in meds:
-            times = json.loads(times_json)
+            times = as_native_json(times_json) or []   # <-- fixed
+            if not isinstance(times, list):
+                continue
             for sched_utc in _today_scheduled_utc(tz, times, datetime.utcnow().date()):
                 delta = abs((now_utc - sched_utc).total_seconds()) / 60.0
                 if delta <= window_minutes:
