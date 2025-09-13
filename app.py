@@ -2,6 +2,7 @@ import os, base64, json, time
 from datetime import datetime, date
 from typing import Optional, List
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import psycopg  # v3
 import requests
@@ -162,14 +163,22 @@ def healthz():
         raise HTTPException(status_code=500, detail=f"DB health check failed: {e}")
 
 @app.post("/v1/patients")
+class PatientIn(BaseModel):
+    name: str
+    dob: date
+    sex_at_birth: Optional[str] = None
+    caregiver_phone: Optional[str] = None
+    patient_phone: Optional[str] = None  # NEW
+
+@app.post("/v1/patients")
 def create_patient(p: PatientIn):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO patients (name, dob, sex_at_birth, caregiver_phone)
-                VALUES (%s,%s,%s,%s)
+                INSERT INTO patients (name, dob, sex_at_birth, caregiver_phone, patient_phone)
+                VALUES (%s,%s,%s,%s,%s)
                 RETURNING id
-            """, (p.name, p.dob, p.sex_at_birth, p.caregiver_phone))
+            """, (p.name, p.dob, p.sex_at_birth, p.caregiver_phone, p.patient_phone))
             (pid,) = cur.fetchone()
         return {"ok": True, "id": str(pid)}
     except Exception as e:
