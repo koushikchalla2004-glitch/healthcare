@@ -1,4 +1,4 @@
-import os, base64, json, time, logging, re, io, mimetypes
+import os, base64, json, time, logging, re, io, mimetypes, csv
 from datetime import datetime, date
 from typing import Optional, List
 from urllib.parse import urlencode
@@ -12,14 +12,12 @@ from pydantic import BaseModel, Field
 from twilio.rest import Client
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-
 # ======================
 # Config & DB connection
 # ======================
 DB_URL = os.getenv("DATABASE_URL")
 if not DB_URL:
     raise RuntimeError("DATABASE_URL env var is required")
-# If using Neon pooled URL, add &channel_binding=prefer to DATABASE_URL
 conn = psycopg.connect(DB_URL, autocommit=True)
 
 # Twilio (optional)
@@ -43,110 +41,42 @@ def _check_admin_key(x_admin_key: str | None):
     if CRON_KEY and x_admin_key != CRON_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# Fitbit OAuth/API
-FITBIT_CLIENT_ID = os.getenv("FITBIT_CLIENT_ID")
-FITBIT_CLIENT_SECRET = os.getenv("FITBIT_CLIENT_SECRET")
-FITBIT_REDIRECT_URI = os.getenv("FITBIT_REDIRECT_URI")  # https://.../oauth/fitbit/callback
-FITBIT_SCOPE = os.getenv("FITBIT_SCOPE", "heartrate activity profile")
-FITBIT_AUTH_URL = "https://www.fitbit.com/oauth2/authorize"
-FITBIT_TOKEN_URL = "https://api.fitbit.com/oauth2/token"
-FITBIT_API = "https://api.fitbit.com"
+# ===== Google Document AI (OCR) init =====
+GCP_DOCAI_PROJECT = os.getenv("GCP_DOCAI_PROJECT")
+GCP_DOCAI_LOCATION = os.getenv("GCP_DOCAI_LOCATION", "us")
+GCP_DOCAI_PROCESSOR_ID = os.getenv("GCP_DOCAI_PROCESSOR_ID")
+GCP_SA_KEY_B64 = os.getenv("GCP_SA_KEY_B64")
 
-def _b64_client() -> str:
-    raw = f"{FITBIT_CLIENT_ID}:{FITBIT_CLIENT_SECRET}".encode()
-    return base64.b64encode(raw).decode()
-
-def _token_headers():
-    return {
-        "Authorization": f"Basic {_b64_client()}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-
-# ===== Timezone helpers =====
-TZ_FIXES = {
-    "America/Austin": "America/Chicago",
-    "Austin": "America/Chicago",
-    "CST": "America/Chicago",
-    "PST": "America/Los_Angeles",
-    "EST": "America/New_York",
-    "MST": "America/Denver",
-    "IST": "Asia/Kolkata",
-    "US/Central": "America/Chicago",
-}
-
-def canonical_tz(tz: str | None) -> str:
-    """Return a safe IANA timezone (fallback to UTC)."""
-    if not tz:
-        return "America/Chicago"
-    t = TZ_FIXES.get(tz.strip(), tz.strip())
-    try:
-        ZoneInfo(t)
-        return t
-    except ZoneInfoNotFoundError:
-        logging.warning(f"Unknown timezone '{tz}', falling back to UTC")
-        return "UTC"
-
-def _fitbit_user_timezone(access_token: str) -> str:
-    hdr = {"Authorization": f"Bearer {access_token}"}
-    try:
-        r = requests.get(f"{FITBIT_API}/1/user/-/profile.json", headers=hdr, timeout=15)
-        if r.status_code == 200:
-            tz = r.json().get("user", {}).get("timezone", "UTC") or "UTC"
-            return canonical_tz(tz)
-    except Exception:
-        pass
-    return "UTC"
-
-def _ensure_fitbit_tokens(patient_id: str):
-    # refresh if expired
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT fitbit_user_id, access_token, refresh_token, EXTRACT(EPOCH FROM expires_at)
-            FROM fitbit_tokens WHERE patient_id=%s
-        """, (patient_id,))
-        row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Fitbit not linked for this patient")
-
-    user_id, access, refresh, exp = row
-    if time.time() < float(exp) - 120:
-        return user_id, access
-
-    # refresh token
-    data = {"grant_type": "refresh_token", "refresh_token": refresh}
-    r = requests.post(FITBIT_TOKEN_URL, data=data, headers=_token_headers(), timeout=20)
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Fitbit refresh failed: {r.text}")
-    tok = r.json()
-    access = tok["access_token"]
-    refresh = tok["refresh_token"]
-    expires_at = int(time.time()) + int(tok.get("expires_in", 28800))
-
-    with conn.cursor() as cur:
-        cur.execute("""
-            UPDATE fitbit_tokens
-               SET access_token=%s,
-                   refresh_token=%s,
-                   expires_at=TO_TIMESTAMP(%s),
-                   scope=%s,
-                   token_type=%s
-             WHERE patient_id=%s
-        """, (access, refresh, expires_at, tok.get("scope"), tok.get("token_type"), patient_id))
-    return user_id, access
-
+_docai_client = None
+_docai_name = None
+try:
+    if GCP_SA_KEY_B64 and GCP_DOCAI_PROJECT and GCP_DOCAI_PROCESSOR_ID:
+        from google.cloud import documentai
+        from google.oauth2 import service_account
+        sa_info = json.loads(base64.b64decode(GCP_SA_KEY_B64))
+        creds = service_account.Credentials.from_service_account_info(sa_info)
+        _docai_client = documentai.DocumentProcessorServiceClient(credentials=creds)
+        _docai_name = _docai_client.processor_path(
+            GCP_DOCAI_PROJECT, GCP_DOCAI_LOCATION, GCP_DOCAI_PROCESSOR_ID
+        )
+        logging.info("Document AI client initialized")
+    else:
+        logging.info("Document AI not configured; OCR disabled")
+except Exception as e:
+    logging.warning(f"DocAI init failed: {e}")
+    _docai_client, _docai_name = None, None
 
 # =========
 # FastAPI
 # =========
-app = FastAPI(title="Health Readmit API", version="1.1.0")
+app = FastAPI(title="Health Readmit API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # =======
 # Models
@@ -162,7 +92,7 @@ class PatientIn(BaseModel):
 class PatientPatch(BaseModel):
     caregiver_phone: Optional[str] = None
     patient_phone: Optional[str] = None
-    timezone: Optional[str] = None  # IANA; will be canonicalized
+    timezone: Optional[str] = None
 
 class Vital(BaseModel):
     ts: datetime
@@ -185,10 +115,10 @@ class AlertIn(BaseModel):
     message: str
 
 class SourceLink(BaseModel):
-    provider: str          # e.g., "fitbit"
-    external_user_id: str  # provider user id
+    provider: str
+    external_user_id: str
 
-# ---- defaults for meds ----
+# Medication defaults
 DEFAULT_TIMESETS = {
   "qd": ["09:00"],
   "daily": ["09:00"],
@@ -203,31 +133,119 @@ class MedicationIn(BaseModel):
     drug_name: str
     dose: str | None = None
     freq: str = "daily"
-    times_local: List[str] | None = None    # OPTIONAL
-    timezone: str | None = None             # OPTIONAL
+    times_local: List[str] | None = None
+    timezone: str | None = None
     start_date: date
     end_date: date | None = None
     is_critical: bool = False
 
 class MedAckIn(BaseModel):
-    scheduled_time: datetime | None = None   # if omitted, ack most recent pending
+    scheduled_time: datetime | None = None
     source: str = "app"
 
+# =========
+# Timezone helpers
+# =========
+TZ_FIXES = {
+    "America/Austin": "America/Chicago",
+    "Austin": "America/Chicago",
+    "CST": "America/Chicago",
+    "PST": "America/Los_Angeles",
+    "EST": "America/New_York",
+    "MST": "America/Denver",
+    "IST": "Asia/Kolkata",
+    "US/Central": "America/Chicago",
+}
+def canonical_tz(tz: str | None) -> str:
+    if not tz:
+        return "America/Chicago"
+    t = TZ_FIXES.get(tz.strip(), tz.strip())
+    try:
+        ZoneInfo(t)
+        return t
+    except ZoneInfoNotFoundError:
+        logging.warning(f"Unknown timezone '{tz}', falling back to UTC")
+        return "UTC"
+
+def _patient_timezone(patient_id: str) -> str:
+    with conn.cursor() as cur:
+        cur.execute("SELECT timezone FROM patients WHERE id=%s", (patient_id,))
+        row = cur.fetchone()
+    return canonical_tz(row[0] if row and row[0] else None)
 
 # =========
-# Regex helpers for unstructured text
+# Shared helpers
+# =========
+def _insert_or_update_vital(cur, patient_id: str, ts: datetime,
+                            hr: int | None = None, steps: int | None = None,
+                            spo2: int | None = None, sbp: int | None = None,
+                            dbp: int | None = None, temp_c: float | None = None):
+    cur.execute("""
+        INSERT INTO vitals (patient_id, ts, hr, steps, spo2, sbp, dbp, temp_c)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (patient_id, ts) DO NOTHING
+    """, (patient_id, ts, hr, steps, spo2, sbp, dbp, temp_c))
+
+def _today_scheduled_utc(tz: str, times_local: List[str], on_date: date) -> List[datetime]:
+    z = ZoneInfo(canonical_tz(tz))
+    out = []
+    for t in times_local:
+        try:
+            hh, mm = [int(x) for x in t.split(":")[:2]]
+            dt_local = datetime(on_date.year, on_date.month, on_date.day, hh, mm, tzinfo=z)
+            out.append(dt_local.astimezone(ZoneInfo("UTC")))
+        except Exception as e:
+            logging.warning(f"Skipping bad time '{t}' for tz={tz}: {e}")
+    return out
+
+def _send_med_sms(patient_id: str, msg: str) -> int:
+    sent = 0
+    with conn.cursor() as cur:
+        cur.execute("SELECT patient_phone, caregiver_phone FROM patients WHERE id=%s", (patient_id,))
+        row = cur.fetchone()
+    if not row:
+        return 0
+    patient_phone, caregiver_phone = row
+    body = f"{msg} Reply STOP to opt out, HELP for help."
+    if patient_phone and send_sms_safe(patient_phone, body): sent += 1
+    if caregiver_phone and send_sms_safe(caregiver_phone, f"CarePulse: {msg}"): sent += 1
+    return sent
+
+def as_native_json(v):
+    if isinstance(v, (list, dict)) or v is None:
+        return v
+    try:
+        return json.loads(v)
+    except Exception:
+        return v
+
+def _normalize_times(times: Optional[List[str]], freq: str) -> List[str]:
+    cand = times if isinstance(times, list) else None
+    if not cand or not any(isinstance(x, str) for x in cand):
+        return DEFAULT_TIMESETS.get(freq.lower(), ["09:00"])
+    cleaned: List[str] = []
+    for t in cand:
+        try:
+            hh, mm = [int(x) for x in t.split(":")[:2]]
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                cleaned.append(f"{hh:02d}:{mm:02d}")
+        except Exception:
+            continue
+    return cleaned if cleaned else DEFAULT_TIMESETS.get(freq.lower(), ["09:00"])
+
+# =========
+# Unstructured parsers (ICD-10 & pharmacy)
 # =========
 ICD10_RE = re.compile(r"\b([A-TV-Z][0-9]{2}(?:\.[0-9A-Za-z]{1,4})?)\b")
 
-# drug + dose + (optional) route + the rest as sig
 MED_LINE = re.compile(
     r"""(?ix)
     ^\s*
     (?P<name>[A-Za-z][\w\-/\s]{1,60}?)        # drug name
     [\s,]+
-    (?P<dose>\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|units|iu))  # dose/strength
-    (?:[,\s;]*(?P<route>po|oral|iv|im|sc|sl|topical|inh))?   # optional route
-    (?P<sig>.*)$                                   # remainder = sig
+    (?P<dose>\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|units|iu))  # dose
+    (?:[,\s;]*(?P<route>po|oral|iv|im|sc|sl|topical|inh))?
+    (?P<sig>.*)$
     """
 )
 
@@ -250,22 +268,18 @@ def _infer_times_from_sig(sig: str | None, freq_fallback: str = "daily") -> List
         return None
     s = sig.lower().strip()
 
-    # explicit clock times (8am, 9:00 pm, 20:00)
     tmatches = re.findall(r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b', s)
     times: List[str] = []
     for hh, mm, ap in tmatches:
-        h = int(hh)
-        m = int(mm or 0)
+        h = int(hh); m = int(mm or 0)
         if ap:
-            ap = ap.lower()
-            if ap == "pm" and h < 12: h += 12
-            if ap == "am" and h == 12: h = 0
+            if ap.lower() == "pm" and h < 12: h += 12
+            if ap.lower() == "am" and h == 12: h = 0
         if 0 <= h <= 23 and 0 <= m <= 59:
             times.append(f"{h:02d}:{m:02d}")
     if times:
         return sorted(list(set(times)))
 
-    # 1-0-1 style (morning-noon-night)
     m = re.search(r'\b([01])\s*-\s*([01])\s*-\s*([01])\b', s)
     if m:
         morning, noon, night = (m.group(i) == "1" for i in (1,2,3))
@@ -275,7 +289,6 @@ def _infer_times_from_sig(sig: str | None, freq_fallback: str = "daily") -> List
         if night:   t.append("21:00")
         return t or None
 
-    # qXh
     mq = re.search(r'\bq\s*([46812]|24)\s*(?:h|hr|hrs|hours)\b', s)
     if mq:
         h = int(mq.group(1))
@@ -285,14 +298,12 @@ def _infer_times_from_sig(sig: str | None, freq_fallback: str = "daily") -> List
         if h == 6:  return ["06:00", "12:00", "18:00", "00:00"]
         if h == 4:  return ["06:00", "10:00", "14:00", "18:00", "22:00", "02:00"]
 
-    # hints
     if any(tok in s for tok in ("hs","nocte","bedtime")): return ["22:00"]
     if any(tok in s for tok in ("mane","morning")):       return ["09:00"]
     if "noon" in s or "afternoon" in s:                   return ["13:00"]
     if "evening" in s:                                    return ["19:00"]
     if "night" in s:                                      return ["21:00"]
 
-    # freq
     if "tid" in s or "3xd" in s:  return ["08:00","14:00","20:00"]
     if "qid" in s or "4xd" in s:  return ["08:00","12:00","16:00","20:00"]
     if "bid" in s or "twice daily" in s or "2xd" in s: return ["09:00","21:00"]
@@ -313,100 +324,39 @@ def _extract_meds_unstructured(text: str) -> List[dict]:
         dose = (m.group("dose") or "").strip()
         route = (m.group("route") or "").lower()
         sig = (m.group("sig") or "").strip()
-        # normalize freq from tokens in sig
         freq = None
         for k, v in SIG_MAP.items():
             if k in sig:
                 freq = "daily" if v in ("morning","noon","evening","night","hs") else v
                 break
-        freq = freq or "daily"
-        meds.append({"drug_name": name, "dose": dose, "route": route, "sig": sig, "freq": freq})
+        meds.append({"drug_name": name, "dose": dose, "route": route, "sig": sig, "freq": freq or "daily"})
     return meds
 
-
 # =========
-# Shared helpers
+# OCR/Plain-text reader for uploads
 # =========
-def _insert_or_update_vital(cur, patient_id: str, ts: datetime,
-                            hr: int | None = None, steps: int | None = None,
-                            spo2: int | None = None, sbp: int | None = None,
-                            dbp: int | None = None, temp_c: float | None = None):
-    cur.execute("""
-        INSERT INTO vitals (patient_id, ts, hr, steps, spo2, sbp, dbp, temp_c)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT (patient_id, ts) DO UPDATE
-          SET hr = COALESCE(EXCLUDED.hr, vitals.hr),
-              steps = COALESCE(EXCLUDED.steps, vitals.steps),
-              spo2 = COALESCE(EXCLUDED.spo2, vitals.spo2),
-              sbp = COALESCE(EXCLUDED.sbp, vitals.sbp),
-              dbp = COALESCE(EXCLUDED.dbp, vitals.dbp),
-              temp_c = COALESCE(EXCLUDED.temp_c, vitals.temp_c)
-    """, (patient_id, ts, hr, steps, spo2, sbp, dbp, temp_c))
-
-def _today_scheduled_utc(tz: str, times_local: List[str], on_date: date) -> List[datetime]:
-    z = ZoneInfo(canonical_tz(tz))
-    out = []
-    for t in times_local:
+def _read_text_from_upload(file: UploadFile) -> str:
+    """If DocAI configured and file is image/pdf, OCR it; else decode as text."""
+    data = file.file.read()
+    ctype = file.content_type or mimetypes.guess_type(file.filename or "")[0] or ""
+    is_scan = ("pdf" in ctype) or ("image" in ctype) or ctype == ""
+    if _docai_client and _docai_name and is_scan:
         try:
-            parts = t.split(":")
-            if len(parts) < 2:
-                raise ValueError("bad format, expected HH:MM")
-            hh, mm = int(parts[0]), int(parts[1])
-            dt_local = datetime(on_date.year, on_date.month, on_date.day, hh, mm, tzinfo=z)
-            out.append(dt_local.astimezone(ZoneInfo("UTC")))
+            from google.cloud import documentai
+            raw_document = documentai.RawDocument(content=data, mime_type=ctype or "application/pdf")
+            request = documentai.ProcessRequest(name=_docai_name, raw_document=raw_document)
+            result = _docai_client.process_document(request=request)
+            return result.document.text or ""
         except Exception as e:
-            logging.warning(f"Skipping bad times_local '{t}' (tz={tz}): {e}")
-            continue
-    return out
-
-def _send_med_sms(patient_id: str, msg: str) -> int:
-    sent = 0
-    with conn.cursor() as cur:
-        cur.execute("SELECT patient_phone, caregiver_phone FROM patients WHERE id=%s", (patient_id,))
-        row = cur.fetchone()
-    if not row:
-        return 0
-    patient_phone, caregiver_phone = row
-    body = f"{msg} Reply STOP to opt out, HELP for help."
-    if patient_phone and send_sms_safe(patient_phone, body): sent += 1
-    if caregiver_phone and send_sms_safe(caregiver_phone, f"CarePulse: {msg}"): sent += 1
-    return sent
-
-def as_native_json(v):
-    """DB JSONB arrives as list/dict via psycopg3; if str, json.loads it; else return as-is."""
-    if isinstance(v, (list, dict)) or v is None:
-        return v
+            logging.warning(f"DocAI processing failed; falling back to text decode: {e}")
+    # Fallback: assume text
     try:
-        return json.loads(v)
+        return data.decode("utf-8", errors="ignore")
     except Exception:
-        return v
-
-def _normalize_times(times: Optional[List[str]], freq: str) -> List[str]:
-    """Return a cleaned list of HH:MM times; if empty/invalid, use defaults from freq."""
-    cand = times if isinstance(times, list) else None
-    if not cand or not any(isinstance(x, str) for x in cand):
-        return DEFAULT_TIMESETS.get(freq.lower(), ["09:00"])
-    cleaned: List[str] = []
-    for t in cand:
-        try:
-            parts = t.split(":")
-            if len(parts) < 2: raise ValueError("bad format")
-            hh, mm = int(parts[0]), int(parts[1])
-            if not (0 <= hh <= 23 and 0 <= mm <= 59): raise ValueError("range")
-            cleaned.append(f"{hh:02d}:{mm:02d}")
-        except Exception:
-            logging.warning(f"Skipping invalid time '{t}' in times_local; using defaults if none valid.")
-    return cleaned if cleaned else DEFAULT_TIMESETS.get(freq.lower(), ["09:00"])
-
-def _patient_timezone(patient_id: str) -> str:
-    with conn.cursor() as cur:
-        cur.execute("SELECT timezone FROM patients WHERE id=%s", (patient_id,))
-        row = cur.fetchone()
-    return canonical_tz(row[0] if row and row[0] else None)
-
+        return ""
 
 # =======
-# Routes
+# Routes: patients
 # =======
 @app.get("/healthz")
 def healthz():
@@ -425,8 +375,7 @@ def create_patient(p: PatientIn):
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO patients (name, dob, sex_at_birth, caregiver_phone, patient_phone, timezone)
-                VALUES (%s,%s,%s,%s,%s,%s)
-                RETURNING id
+                VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
             """, (p.name, p.dob, p.sex_at_birth, p.caregiver_phone, p.patient_phone, tz))
             (pid,) = cur.fetchone()
         return {"ok": True, "id": str(pid)}
@@ -488,7 +437,6 @@ def link_source(patient_id: str, body: SourceLink):
 # -------- Vitals & alerts --------
 @app.post("/v1/vitals")
 def ingest_vitals(batch: VitalsBatch):
-    # Sanity filter
     clean = []
     for s in batch.samples:
         if s.hr is not None and (s.hr < 25 or s.hr > 220): continue
@@ -519,12 +467,11 @@ def ingest_vitals(batch: VitalsBatch):
             if last.hr is not None and (last.hr < 40 or last.hr > 135):
                 candidates.append(("HR_ABNORMAL", "HIGH", f"HR {last.hr} abnormal at {last.ts.isoformat()}"))
 
-            alerts_created, sms_sent = 0, 0
             for t, se, msg in candidates:
                 cur.execute("""
                     SELECT COUNT(*) FROM alerts
-                     WHERE patient_id=%s AND type=%s
-                       AND created_at > now() - interval '15 minutes'
+                    WHERE patient_id=%s AND type=%s
+                      AND created_at > now() - interval '15 minutes'
                 """, (batch.patient_id, t))
                 recent = cur.fetchone()[0] > 0
 
@@ -532,12 +479,10 @@ def ingest_vitals(batch: VitalsBatch):
                     INSERT INTO alerts (patient_id, type, severity, message)
                     VALUES (%s,%s,%s,%s)
                 """, (batch.patient_id, t, se, msg))
-                alerts_created += 1
+                if se == "HIGH" and not recent and caregiver_phone:
+                    send_sms_safe(caregiver_phone, f"[ALERT] {msg}")
 
-                if se == "HIGH" and not recent and send_sms_safe(caregiver_phone, f"[ALERT] {msg}"):
-                    sms_sent += 1
-
-        return {"ok": True, "inserted": len(clean), "alerts_created": alerts_created, "sms_sent": sms_sent}
+        return {"ok": True, "inserted": len(clean)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
@@ -561,177 +506,165 @@ def list_alerts(patient_id: str):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, type, severity, message, created_at, status
-                  FROM alerts
-                 WHERE patient_id=%s
-              ORDER BY created_at DESC
-                 LIMIT 50
+                FROM alerts WHERE patient_id=%s
+                ORDER BY created_at DESC LIMIT 50
             """, (patient_id,))
             rows = cur.fetchall()
-        return [
-            {"id": str(r[0]), "type": r[1], "severity": r[2], "message": r[3],
-             "created_at": r[4].isoformat(), "status": r[5]}
-            for r in rows
-        ]
+        return [{
+            "id": str(r[0]), "type": r[1], "severity": r[2], "message": r[3],
+            "created_at": r[4].isoformat(), "status": r[5]
+        } for r in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
-
 
 # -------- Fitbit OAuth + Sync --------
 @app.get("/oauth/fitbit/start")
 def fitbit_start(patient_id: str = Query(..., description="UUID of patient")):
-    if not (FITBIT_CLIENT_ID and FITBIT_REDIRECT_URI):
+    if not (os.getenv("FITBIT_CLIENT_ID") and os.getenv("FITBIT_REDIRECT_URI")):
         raise HTTPException(status_code=500, detail="Fitbit env vars missing")
     q = {
-        "client_id": FITBIT_CLIENT_ID,
-        "redirect_uri": FITBIT_REDIRECT_URI,
+        "client_id": os.getenv("FITBIT_CLIENT_ID"),
+        "redirect_uri": os.getenv("FITBIT_REDIRECT_URI"),
         "response_type": "code",
-        "scope": FITBIT_SCOPE,
+        "scope": os.getenv("FITBIT_SCOPE", "heartrate activity profile"),
         "prompt": "consent",
         "state": patient_id,
     }
-    return RedirectResponse(f"{FITBIT_AUTH_URL}?{urlencode(q)}")
+    return RedirectResponse(f"https://www.fitbit.com/oauth2/authorize?{urlencode(q)}")
 
 @app.get("/oauth/fitbit/callback")
 def fitbit_callback(code: str, state: str):
     data = {
-        "client_id": FITBIT_CLIENT_ID,
+        "client_id": os.getenv("FITBIT_CLIENT_ID"),
         "grant_type": "authorization_code",
-        "redirect_uri": FITBIT_REDIRECT_URI,
+        "redirect_uri": os.getenv("FITBIT_REDIRECT_URI"),
         "code": code,
     }
-    r = requests.post(FITBIT_TOKEN_URL, data=data, headers=_token_headers(), timeout=20)
+    r = requests.post("https://api.fitbit.com/oauth2/token", data=data,
+                      headers={"Authorization": "Basic " + base64.b64encode(
+                          (os.getenv("FITBIT_CLIENT_ID") + ":" + os.getenv("FITBIT_CLIENT_SECRET")).encode()
+                      ).decode()}, timeout=20)
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Token exchange failed: {r.text}")
     tok = r.json()
     fitbit_user_id = tok.get("user_id")
-    access = tok["access_token"]
-    refresh = tok["refresh_token"]
+    access = tok["access_token"]; refresh = tok["refresh_token"]
     expires_at = int(time.time()) + int(tok.get("expires_in", 28800))
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO fitbit_tokens (patient_id, fitbit_user_id, access_token, refresh_token, expires_at, scope, token_type)
+                VALUES (%s,%s,%s,%s, TO_TIMESTAMP(%s), %s, %s)
+                ON CONFLICT (patient_id) DO UPDATE
+                  SET fitbit_user_id=EXCLUDED.fitbit_user_id,
+                      access_token=EXCLUDED.access_token,
+                      refresh_token=EXCLUDED.refresh_token,
+                      expires_at=EXCLUDED.expires_at,
+                      scope=EXCLUDED.scope,
+                      token_type=EXCLUDED.token_type
+            """, (state, fitbit_user_id, access, refresh, expires_at, tok.get("scope"), tok.get("token_type")))
+            cur.execute("""
+                INSERT INTO patient_sources (patient_id, provider, external_user_id)
+                VALUES (%s,'fitbit',%s)
+                ON CONFLICT (provider, external_user_id) DO UPDATE SET patient_id=EXCLUDED.patient_id
+            """, (state, fitbit_user_id))
+        return {"ok": True, "linked": True, "patient_id": state, "fitbit_user_id": fitbit_user_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
+def _ensure_fitbit_tokens(patient_id: str):
     with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO fitbit_tokens (patient_id, fitbit_user_id, access_token, refresh_token, expires_at, scope, token_type)
-            VALUES (%s,%s,%s,%s, TO_TIMESTAMP(%s), %s, %s)
-            ON CONFLICT (patient_id) DO UPDATE
-              SET fitbit_user_id=EXCLUDED.fitbit_user_id,
-                  access_token=EXCLUDED.access_token,
-                  refresh_token=EXCLUDED.refresh_token,
-                  expires_at=EXCLUDED.expires_at,
-                  scope=EXCLUDED.scope,
-                  token_type=EXCLUDED.token_type
-        """, (state, fitbit_user_id, access, refresh, expires_at, tok.get("scope"), tok.get("token_type")))
-        cur.execute("""
-            INSERT INTO patient_sources (patient_id, provider, external_user_id)
-            VALUES (%s,'fitbit',%s)
-            ON CONFLICT (provider, external_user_id) DO UPDATE SET patient_id=EXCLUDED.patient_id
-        """, (state, fitbit_user_id))
-    return {"ok": True, "linked": True, "patient_id": state, "fitbit_user_id": fitbit_user_id}
+        cur.execute("""SELECT fitbit_user_id, access_token, refresh_token, EXTRACT(EPOCH FROM expires_at)
+                       FROM fitbit_tokens WHERE patient_id=%s""", (patient_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Fitbit not linked for this patient")
+    user_id, access, refresh, exp = row
+    if time.time() < float(exp) - 120:
+        return user_id, access
+    # refresh
+    r = requests.post("https://api.fitbit.com/oauth2/token",
+                      data={"grant_type":"refresh_token","refresh_token":refresh},
+                      headers={"Authorization": "Basic " + base64.b64encode(
+                          (os.getenv("FITBIT_CLIENT_ID") + ":" + os.getenv("FITBIT_CLIENT_SECRET")).encode()
+                      ).decode()}, timeout=20)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Fitbit refresh failed: {r.text}")
+    tok = r.json()
+    access = tok["access_token"]; refresh = tok["refresh_token"]
+    expires_at = int(time.time()) + int(tok.get("expires_in", 28800))
+    with conn.cursor() as cur:
+        cur.execute("""UPDATE fitbit_tokens SET access_token=%s, refresh_token=%s, expires_at=TO_TIMESTAMP(%s),
+                       scope=%s, token_type=%s WHERE patient_id=%s""",
+                    (access, refresh, expires_at, tok.get("scope"), tok.get("token_type"), patient_id))
+    return user_id, access
 
 @app.get("/integrations/fitbit/sync")
-def fitbit_sync(
-    patient_id: str,
-    x_admin_key: str | None = Header(default=None)
-):
+def fitbit_sync(patient_id: str, x_admin_key: str | None = Header(default=None)):
     _check_admin_key(x_admin_key)
-
     fitbit_user_id, access = _ensure_fitbit_tokens(patient_id)
     headers = {"Authorization": f"Bearer {access}"}
-
-    # Intraday 1-min HR & steps for today (Fitbit local time)
-    r1 = requests.get(f"{FITBIT_API}/1/user/-/activities/heart/date/today/1d/1min.json",
-                      headers=headers, timeout=20)
-    if r1.status_code not in (200, 204):
-        raise HTTPException(status_code=502, detail=f"Fitbit HR fetch failed: {r1.text}")
-    r2 = requests.get(f"{FITBIT_API}/1/user/-/activities/steps/date/today/1d/1min.json",
-                      headers=headers, timeout=20)
-    if r2.status_code not in (200, 204):
-        raise HTTPException(status_code=502, detail=f"Fitbit steps fetch failed: {r2.text}")
-
-    ds_hr = r1.json().get("activities-heart-intraday", {}).get("dataset", [])
-    ds_steps = r2.json().get("activities-steps-intraday", {}).get("dataset", [])
-    if not isinstance(ds_hr, list): ds_hr = []
-    if not isinstance(ds_steps, list): ds_steps = []
-
-    # Convert Fitbit local times to UTC using user's tz
-    tz_str = _fitbit_user_timezone(access)
-    user_tz = ZoneInfo(tz_str)
-    today_local = datetime.now(user_tz).date()
+    r1 = requests.get("https://api.fitbit.com/1/user/-/activities/heart/date/today/1d/1min.json", headers=headers, timeout=20)
+    if r1.status_code not in (200, 204): raise HTTPException(status_code=502, detail=f"Fitbit HR fetch failed: {r1.text}")
+    r2 = requests.get("https://api.fitbit.com/1/user/-/activities/steps/date/today/1d/1min.json", headers=headers, timeout=20)
+    if r2.status_code not in (200, 204): raise HTTPException(status_code=502, detail=f"Fitbit steps fetch failed: {r2.text}")
+    ds_hr = r1.json().get("activities-heart-intraday", {}).get("dataset", []) or []
+    ds_steps = r2.json().get("activities-steps-intraday", {}).get("dataset", []) or []
+    tz_str = _fitbit_user_timezone(access); user_tz = ZoneInfo(tz_str); today_local = datetime.now(user_tz).date()
 
     def to_utc(hms: str) -> datetime:
-        hh, mm, ss = map(int, hms.split(":"))
+        hh, mm, ss = [int(x) for x in hms.split(":")]
         dt_local = datetime(today_local.year, today_local.month, today_local.day, hh, mm, ss, tzinfo=user_tz)
         return dt_local.astimezone(ZoneInfo("UTC"))
 
-    inserted = 0
-    last_hr = None
+    inserted = 0; last_hr = None
     with conn.cursor() as cur:
         for p in ds_hr[-120:]:
-            t = to_utc(p["time"])
-            last_hr = int(p["value"])
-            _insert_or_update_vital(cur, patient_id, t, hr=last_hr)
-            inserted += 1
+            t = to_utc(p["time"]); last_hr = int(p["value"]); _insert_or_update_vital(cur, patient_id, t, hr=last_hr); inserted += 1
         for p in ds_steps[-120:]:
-            t = to_utc(p["time"])
-            _insert_or_update_vital(cur, patient_id, t, steps=int(p["value"]))
-            inserted += 1
+            t = to_utc(p["time"]); _insert_or_update_vital(cur, patient_id, t, steps=int(p["value"])); inserted += 1
 
-        # simple alert on latest HR
         if last_hr is not None and (last_hr < 40 or last_hr > 135):
             msg = f"HR {last_hr} abnormal (Fitbit sync)"
-            cur.execute("""
-                SELECT COUNT(*) FROM alerts
-                 WHERE patient_id=%s AND type='HR_ABNORMAL'
-                   AND created_at > now() - interval '15 minutes'
-            """, (patient_id,))
+            cur.execute("""SELECT COUNT(*) FROM alerts WHERE patient_id=%s AND type='HR_ABNORMAL'
+                           AND created_at > now() - interval '15 minutes'""", (patient_id,))
             recent = cur.fetchone()[0] > 0
-            cur.execute("""
-                INSERT INTO alerts (patient_id, type, severity, message)
-                VALUES (%s,'HR_ABNORMAL','HIGH',%s)
-            """, (patient_id, msg))
+            cur.execute("""INSERT INTO alerts (patient_id, type, severity, message)
+                           VALUES (%s,'HR_ABNORMAL','HIGH',%s)""", (patient_id, msg))
             if not recent:
                 cur.execute("SELECT caregiver_phone FROM patients WHERE id=%s", (patient_id,))
                 row = cur.fetchone()
                 if row and row[0]:
                     send_sms_safe(row[0], f"[ALERT] {msg}")
-
     return {"ok": True, "fitbit_user_id": fitbit_user_id, "records_processed": inserted}
 
 @app.get("/integrations/fitbit/sync_all")
-def fitbit_sync_all(
-    x_admin_key: str | None = Header(default=None)
-):
+def fitbit_sync_all(x_admin_key: str | None = Header(default=None)):
     _check_admin_key(x_admin_key)
     processed, failed = 0, []
     with conn.cursor() as cur:
         cur.execute("SELECT patient_id FROM fitbit_tokens")
         ids = [str(r[0]) for r in cur.fetchall()]
-
     for pid in ids:
         try:
-            fitbit_sync(pid, x_admin_key=x_admin_key)  # reuse logic
-            processed += 1
+            fitbit_sync(pid, x_admin_key=x_admin_key); processed += 1
         except Exception as e:
             failed.append({"patient_id": pid, "error": str(e)})
-
     logging.info(f"[sync_all] processed={processed} failed={len(failed)}")
     return {"ok": True, "processed": processed, "failed": failed}
 
-
-# -------- Medications: create/list/ack + reminder cron --------
+# -------- Medications: CRUD-ish + reminder + escalation --------
 @app.post("/v1/meds")
 def create_med(m: MedicationIn):
     try:
         tz = canonical_tz(m.timezone or _patient_timezone(m.patient_id))
         times = _normalize_times(m.times_local, m.freq)
-
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO medications
                 (patient_id, drug_name, dose, freq, times_local, timezone, start_date, end_date, is_critical)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                RETURNING id
-            """, (m.patient_id, m.drug_name, m.dose, m.freq,
-                  json.dumps(times), tz, m.start_date, m.end_date, m.is_critical))
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+            """, (m.patient_id, m.drug_name, m.dose, m.freq, json.dumps(times), tz, m.start_date, m.end_date, m.is_critical))
             (mid,) = cur.fetchone()
         return {"ok": True, "medication_id": str(mid), "times_local": times, "timezone": tz}
     except Exception as e:
@@ -743,25 +676,15 @@ def list_meds(patient_id: str):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, drug_name, dose, freq, times_local, timezone, start_date, end_date, is_critical
-                  FROM medications
-                 WHERE patient_id=%s
-                 ORDER BY created_at DESC
+                FROM medications WHERE patient_id=%s ORDER BY created_at DESC
             """, (patient_id,))
             rows = cur.fetchall()
-        res = []
-        for r in rows:
-            res.append({
-                "id": str(r[0]),
-                "drug_name": r[1],
-                "dose": r[2],
-                "freq": r[3],
-                "times_local": as_native_json(r[4]),
-                "timezone": r[5],
-                "start_date": r[6].isoformat(),
-                "end_date": r[7].isoformat() if r[7] else None,
-                "is_critical": r[8]
-            })
-        return res
+        return [{
+            "id": str(r[0]), "drug_name": r[1], "dose": r[2], "freq": r[3],
+            "times_local": as_native_json(r[4]), "timezone": r[5],
+            "start_date": r[6].isoformat(), "end_date": r[7].isoformat() if r[7] else None,
+            "is_critical": r[8]
+        } for r in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
@@ -770,32 +693,22 @@ def ack_med(med_id: str, body: MedAckIn):
     try:
         with conn.cursor() as cur:
             if body.scheduled_time is None:
-                cur.execute("""
-                    SELECT scheduled_time FROM med_adherence
-                     WHERE medication_id=%s AND taken=false
-                 ORDER BY scheduled_time DESC
-                    LIMIT 1
-                """, (med_id,))
+                cur.execute("""SELECT scheduled_time FROM med_adherence
+                               WHERE medication_id=%s AND taken=false
+                               ORDER BY scheduled_time DESC LIMIT 1""", (med_id,))
                 row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail="No pending dose to acknowledge")
+                if not row: raise HTTPException(status_code=404, detail="No pending dose to acknowledge")
                 sched = row[0]
             else:
                 sched = body.scheduled_time
-
-            cur.execute("""
-                UPDATE med_adherence
-                   SET taken=true, taken_time=now(), source=%s
-                 WHERE medication_id=%s AND scheduled_time=%s
-                 RETURNING id
-            """, (body.source, med_id, sched))
+            cur.execute("""UPDATE med_adherence SET taken=true, taken_time=now(), source=%s
+                           WHERE medication_id=%s AND scheduled_time=%s RETURNING id""",
+                        (body.source, med_id, sched))
             u = cur.fetchone()
             if not u:
-                cur.execute("""
-                    INSERT INTO med_adherence (medication_id, scheduled_time, taken, taken_time, source)
-                    VALUES (%s,%s,true,now(),%s)
-                    RETURNING id
-                """, (med_id, sched, body.source))
+                cur.execute("""INSERT INTO med_adherence (medication_id, scheduled_time, taken, taken_time, source)
+                               VALUES (%s,%s,true,now(),%s) RETURNING id""",
+                            (med_id, sched, body.source))
                 u = cur.fetchone()
         return {"ok": True, "id": str(u[0]), "scheduled_time": sched.isoformat()}
     except HTTPException:
@@ -810,57 +723,39 @@ def list_adherence(patient_id: str, limit: int = 50):
             cur.execute("""
                 SELECT ma.id, ma.medication_id, ma.scheduled_time, ma.taken, ma.taken_time, ma.source,
                        m.drug_name, m.dose
-                  FROM med_adherence ma
-                  JOIN medications m ON m.id = ma.medication_id
-                 WHERE m.patient_id = %s
-              ORDER BY ma.scheduled_time DESC
-                 LIMIT %s
+                FROM med_adherence ma JOIN medications m ON m.id = ma.medication_id
+                WHERE m.patient_id=%s ORDER BY ma.scheduled_time DESC LIMIT %s
             """, (patient_id, limit))
             rows = cur.fetchall()
         return [{
-            "id": str(r[0]),
-            "medication_id": str(r[1]),
-            "scheduled_time": r[2].isoformat(),
-            "taken": r[3],
-            "taken_time": r[4].isoformat() if r[4] else None,
-            "source": r[5],
-            "drug_name": r[6],
-            "dose": r[7]
+            "id": str(r[0]), "medication_id": str(r[1]), "scheduled_time": r[2].isoformat(),
+            "taken": r[3], "taken_time": r[4].isoformat() if r[4] else None,
+            "source": r[5], "drug_name": r[6], "dose": r[7]
         } for r in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-# ----- Reminder cron (with window override) -----
 @app.get("/cron/meds/remind_now")
-def meds_remind_now(
-    x_admin_key: str | None = Header(default=None),
-    window: int = Query(5, ge=1, le=60)
-):
+def meds_remind_now(x_admin_key: str | None = Header(default=None),
+                    window: int = Query(5, ge=1, le=60)):
     _check_admin_key(x_admin_key)
-
-    now_utc = datetime.now(ZoneInfo("UTC"))  # aware
-    window_minutes = window
-    sent_total = 0
-    created_total = 0
-
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    sent_total = 0; created_total = 0
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id, patient_id, times_local, timezone, start_date, end_date
-              FROM medications
-             WHERE start_date <= CURRENT_DATE
-               AND (end_date IS NULL OR end_date >= CURRENT_DATE)
+            FROM medications
+            WHERE start_date <= CURRENT_DATE AND (end_date IS NULL OR end_date >= CURRENT_DATE)
         """)
         meds = cur.fetchall()
-
         for mid, pid, times_json, tz, sdate, edate in meds:
             times = as_native_json(times_json) or []
-            if not isinstance(times, list):
-                continue
+            if not isinstance(times, list): continue
             tz_can = canonical_tz(tz)
-            local_today = datetime.now(ZoneInfo(tz_can)).date()  # patient's local day
+            local_today = datetime.now(ZoneInfo(tz_can)).date()
             for sched_utc in _today_scheduled_utc(tz_can, times, local_today):
-                delta = abs((now_utc - sched_utc).total_seconds()) / 60.0
-                if delta <= window_minutes:
+                delta = abs((now_utc - sched_utc).total_seconds())/60.0
+                if delta <= window:
                     cur.execute("""
                         INSERT INTO med_adherence (medication_id, scheduled_time, taken)
                         VALUES (%s,%s,false)
@@ -870,87 +765,64 @@ def meds_remind_now(
                     ins = cur.fetchone()
                     if ins:
                         created_total += 1
-                        sent_total += _send_med_sms(
-                            pid,
-                            "Medication time: please take your scheduled dose."
-                        )
+                        sent_total += _send_med_sms(pid, "Medication time: please take your scheduled dose.")
     logging.info(f"[meds_remind_now] created={created_total} sms_sent={sent_total}")
     return {"ok": True, "reminders_created": created_total, "sms_sent": sent_total}
 
-# ----- Missed-dose escalation cron (≥30 minutes late) -----
 @app.get("/cron/meds/escalate_missed")
 def meds_escalate_missed(x_admin_key: str | None = Header(default=None)):
     _check_admin_key(x_admin_key)
     now_utc = datetime.now(ZoneInfo("UTC"))
-    escalations = 0
-    sms_sent = 0
-
+    escalations = 0; sms_sent = 0
     with conn.cursor() as cur:
         cur.execute("""
             SELECT ma.id, ma.medication_id, m.patient_id, m.is_critical, m.timezone, ma.scheduled_time
-              FROM med_adherence ma
-              JOIN medications m ON m.id = ma.medication_id
-             WHERE ma.taken = false
-               AND ma.scheduled_time <= %s - interval '30 minutes'
-               AND ma.scheduled_time >= %s - interval '6 hours'
-               AND NOT EXISTS (
-                 SELECT 1 FROM alerts a
-                  WHERE a.patient_id = m.patient_id
-                    AND a.type = 'MISSED_DOSE'
-                    AND a.created_at > ma.scheduled_time
-               )
+            FROM med_adherence ma JOIN medications m ON m.id = ma.medication_id
+            WHERE ma.taken=false
+              AND ma.scheduled_time <= %s - interval '30 minutes'
+              AND ma.scheduled_time >= %s - interval '6 hours'
+              AND NOT EXISTS (
+                SELECT 1 FROM alerts a
+                WHERE a.patient_id = m.patient_id
+                  AND a.type = 'MISSED_DOSE'
+                  AND a.created_at > ma.scheduled_time
+              )
         """, (now_utc, now_utc))
         rows = cur.fetchall()
-
         for _ad_id, _med_id, pid, is_critical, tz, sched in rows:
             sev = "HIGH" if is_critical else "MEDIUM"
             msg = f"Missed medication dose scheduled at {sched.isoformat()}."
-            cur.execute("""
-                INSERT INTO alerts (patient_id, type, severity, message)
-                VALUES (%s,'MISSED_DOSE',%s,%s)
-            """, (pid, sev, msg))
+            cur.execute("""INSERT INTO alerts (patient_id, type, severity, message)
+                           VALUES (%s,'MISSED_DOSE',%s,%s)""",
+                        (pid, sev, msg))
             escalations += 1
-            sms_sent += _send_med_sms(pid, f"Missed dose: please check in. Scheduled at local time.")
-
+            sms_sent += _send_med_sms(pid, "Missed dose: please check in. Scheduled at local time.")
     logging.info(f"[escalate_missed] escalations={escalations} sms_sent={sms_sent}")
     return {"ok": True, "escalations": escalations, "sms_sent": sms_sent}
 
+# ===== Unstructured uploads with OCR support =====
+def _read_plain_or_ocr(file: UploadFile) -> str:
+    """Wrapper for endpoints: reads entire file once and routes to OCR or text."""
+    return _read_text_from_upload(file)
 
-# ===== Unstructured uploads =====
-def _read_plain_text_from_upload(file: UploadFile) -> str:
-    data = file.file.read()
-    try:
-        return data.decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
-
+# Discharge summary → diagnoses (ICD-10)
 @app.post("/v1/docs/discharge_text")
-async def upload_discharge_text(
-    patient_id: str = Form(...),
-    file: UploadFile | None = File(None),
-    text: str | None = Form(None)
-):
-    """
-    Accepts unstructured discharge summary (either .txt file or 'text' form field)
-    and extracts ICD-10 codes into `diagnoses` (+records a document row).
-    """
-    # Get raw text
+async def upload_discharge_text(patient_id: str = Form(...),
+                                file: UploadFile | None = File(None),
+                                text: str | None = Form(None)):
     if text and text.strip():
         raw_text = text
     elif file:
-        if not (file.filename or "").lower().endswith(".txt"):
-            raise HTTPException(status_code=400, detail="Please upload a .txt file or use the 'text' field.")
-        raw_text = _read_plain_text_from_upload(file)
+        raw_text = _read_plain_or_ocr(file)
     else:
-        raise HTTPException(status_code=400, detail="Provide a .txt file or 'text' form field.")
+        raise HTTPException(status_code=400, detail="Provide a .txt/.pdf/image file or 'text' form field.")
 
-    # record document
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO documents (patient_id, filename, content_type, status)
-                VALUES (%s,%s,%s,'done') RETURNING id
-            """, (patient_id, (file.filename if file else "discharge_text.txt"), "text/plain"))
+            cur.execute("""INSERT INTO documents (patient_id, filename, content_type, status)
+                           VALUES (%s,%s,%s,'done') RETURNING id""",
+                        (patient_id, (file.filename if file else "discharge_text.txt"),
+                         (file.content_type if file else "text/plain")))
             (doc_id,) = cur.fetchone()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error creating doc: {e}")
@@ -960,35 +832,25 @@ async def upload_discharge_text(
     try:
         with conn.cursor() as cur:
             for code in dx_codes:
-                cur.execute("""
-                    INSERT INTO diagnoses (patient_id, source_document_id, icd10, description)
-                    VALUES (%s,%s,%s,NULL)
-                """, (patient_id, doc_id, code))
+                cur.execute("""INSERT INTO diagnoses (patient_id, source_document_id, icd10, description)
+                               VALUES (%s,%s,%s,NULL)""",
+                            (patient_id, doc_id, code))
                 dx_created += 1
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error saving diagnoses: {e}")
-
     return {"ok": True, "document_id": str(doc_id), "diagnoses_created": dx_created}
 
+# Pharmacy sheet → medications (unstructured text or scan)
 @app.post("/v1/docs/meds_text")
-async def upload_meds_text(
-    patient_id: str = Form(...),
-    file: UploadFile | None = File(None),
-    text: str | None = Form(None),
-):
-    """
-    Accepts free-form pharmacy text: either a .txt file or a 'text' form field.
-    Parses drug name + dose + sig (e.g., 1-0-1, q12h, hs, bid) and creates medications.
-    """
-    # get raw text
+async def upload_meds_text(patient_id: str = Form(...),
+                           file: UploadFile | None = File(None),
+                           text: str | None = Form(None)):
     if text and text.strip():
         raw_text = text
     elif file:
-        if not (file.filename or "").lower().endswith(".txt"):
-            raise HTTPException(status_code=400, detail="Please upload a .txt file or pass 'text' field.")
-        raw_text = _read_plain_text_from_upload(file)
+        raw_text = _read_plain_or_ocr(file)
     else:
-        raise HTTPException(status_code=400, detail="Provide a .txt file or 'text' form field.")
+        raise HTTPException(status_code=400, detail="Provide a .txt/.pdf/image file or 'text' form field.")
 
     meds = _extract_meds_unstructured(raw_text)
     if not meds:
@@ -998,26 +860,22 @@ async def upload_meds_text(
     created = 0
     try:
         with conn.cursor() as cur:
-            # record doc row (provenance)
-            cur.execute("""
-                INSERT INTO documents (patient_id, filename, content_type, status)
-                VALUES (%s,%s,%s,'done') RETURNING id
-            """, (patient_id, (file.filename if file else "pharmacy_text.txt"), "text/plain"))
+            cur.execute("""INSERT INTO documents (patient_id, filename, content_type, status)
+                           VALUES (%s,%s,%s,'done') RETURNING id""",
+                        (patient_id, (file.filename if file else "pharmacy_text.txt"),
+                         (file.content_type if file else "text/plain")))
             (doc_id,) = cur.fetchone()
 
-            for m in meds[:25]:  # cap to avoid noisy bulk inserts
+            for m in meds[:25]:
                 inferred = _infer_times_from_sig(m["sig"], m["freq"])
                 times = inferred or _normalize_times(None, m["freq"])
                 cur.execute("""
                     INSERT INTO medications
                     (patient_id, drug_name, dose, freq, times_local, timezone, start_date, end_date, is_critical)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (
-                    patient_id, m["drug_name"], m["dose"], m["freq"],
-                    json.dumps(times), tz, date.today(), None, False
-                ))
+                """, (patient_id, m["drug_name"], m["dose"], m["freq"],
+                      json.dumps(times), tz, date.today(), None, False))
                 created += 1
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Text ingest error: {e}")
-
+        raise HTTPException(status_code=500, detail=f"Text/OCR ingest error: {e}")
     return {"ok": True, "medications_created": created}
