@@ -138,7 +138,7 @@ def _ensure_fitbit_tokens(patient_id: str):
 # =========
 # FastAPI
 # =========
-app = FastAPI(title="Health Readmit API", version="0.8.0")
+app = FastAPI(title="Health Readmit API", version="0.9.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
@@ -158,6 +158,11 @@ class PatientIn(BaseModel):
     caregiver_phone: Optional[str] = None
     patient_phone: Optional[str] = None
     timezone: Optional[str] = None  # default applied if None
+
+class PatientPatch(BaseModel):
+    caregiver_phone: Optional[str] = None
+    patient_phone: Optional[str] = None
+    timezone: Optional[str] = None  # IANA; will be canonicalized
 
 class Vital(BaseModel):
     ts: datetime
@@ -315,6 +320,44 @@ def create_patient(p: PatientIn):
             """, (p.name, p.dob, p.sex_at_birth, p.caregiver_phone, p.patient_phone, tz))
             (pid,) = cur.fetchone()
         return {"ok": True, "id": str(pid)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+@app.get("/v1/patients/{patient_id}")
+def get_patient(patient_id: str):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, dob, sex_at_birth, caregiver_phone, patient_phone, timezone
+                FROM patients WHERE id=%s
+            """, (patient_id,))
+            r = cur.fetchone()
+        if not r:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        return {
+            "id": str(r[0]), "name": r[1], "dob": r[2].isoformat(),
+            "sex_at_birth": r[3], "caregiver_phone": r[4],
+            "patient_phone": r[5], "timezone": r[6]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+@app.patch("/v1/patients/{patient_id}")
+def patch_patient(patient_id: str, body: PatientPatch):
+    try:
+        fields, vals = [], []
+        if body.caregiver_phone is not None:
+            fields.append("caregiver_phone=%s"); vals.append(body.caregiver_phone)
+        if body.patient_phone is not None:
+            fields.append("patient_phone=%s"); vals.append(body.patient_phone)
+        if body.timezone is not None:
+            fields.append("timezone=%s"); vals.append(canonical_tz(body.timezone))
+        if not fields:
+            return {"ok": True, "updated": 0}
+        vals.append(patient_id)
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE patients SET {', '.join(fields)} WHERE id=%s", vals)
+        return {"ok": True, "updated": 1}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
@@ -571,7 +614,6 @@ def fitbit_sync_all(
 @app.post("/v1/meds")
 def create_med(m: MedicationIn):
     try:
-        # Defaults from patient/timezone and freq
         tz = canonical_tz(m.timezone or _patient_timezone(m.patient_id))
         times = _normalize_times(m.times_local, m.freq)
 
@@ -654,12 +696,43 @@ def ack_med(med_id: str, body: MedAckIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
+@app.get("/v1/adherence")
+def list_adherence(patient_id: str, limit: int = 50):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ma.id, ma.medication_id, ma.scheduled_time, ma.taken, ma.taken_time, ma.source,
+                       m.drug_name, m.dose
+                  FROM med_adherence ma
+                  JOIN medications m ON m.id = ma.medication_id
+                 WHERE m.patient_id = %s
+              ORDER BY ma.scheduled_time DESC
+                 LIMIT %s
+            """, (patient_id, limit))
+            rows = cur.fetchall()
+        return [{
+            "id": str(r[0]),
+            "medication_id": str(r[1]),
+            "scheduled_time": r[2].isoformat(),
+            "taken": r[3],
+            "taken_time": r[4].isoformat() if r[4] else None,
+            "source": r[5],
+            "drug_name": r[6],
+            "dose": r[7]
+        } for r in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+# ----- Reminder cron (with window override) -----
 @app.get("/cron/meds/remind_now")
-def meds_remind_now(x_admin_key: str | None = Header(default=None)):
+def meds_remind_now(
+    x_admin_key: str | None = Header(default=None),
+    window: int = Query(5, ge=1, le=60)
+):
     _check_admin_key(x_admin_key)
 
     now_utc = datetime.now(ZoneInfo("UTC"))  # aware
-    window_minutes = 5  # align with cron frequency
+    window_minutes = window
     sent_total = 0
     created_total = 0
 
@@ -676,9 +749,8 @@ def meds_remind_now(x_admin_key: str | None = Header(default=None)):
             times = as_native_json(times_json) or []
             if not isinstance(times, list):
                 continue
-            # compute schedule for the patient's LOCAL day
             tz_can = canonical_tz(tz)
-            local_today = datetime.now(ZoneInfo(tz_can)).date()
+            local_today = datetime.now(ZoneInfo(tz_can)).date()  # patient's local day
             for sched_utc in _today_scheduled_utc(tz_can, times, local_today):
                 delta = abs((now_utc - sched_utc).total_seconds()) / 60.0
                 if delta <= window_minutes:
@@ -698,3 +770,41 @@ def meds_remind_now(x_admin_key: str | None = Header(default=None)):
                         )
     logging.info(f"[meds_remind_now] created={created_total} sms_sent={sent_total}")
     return {"ok": True, "reminders_created": created_total, "sms_sent": sent_total}
+
+# ----- Missed-dose escalation cron (≥30 minutes late) -----
+@app.get("/cron/meds/escalate_missed")
+def meds_escalate_missed(x_admin_key: str | None = Header(default=None)):
+    _check_admin_key(x_admin_key)
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    escalations = 0
+    sms_sent = 0
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT ma.id, ma.medication_id, m.patient_id, m.is_critical, m.timezone, ma.scheduled_time
+              FROM med_adherence ma
+              JOIN medications m ON m.id = ma.medication_id
+             WHERE ma.taken = false
+               AND ma.scheduled_time <= %s - interval '30 minutes'
+               AND ma.scheduled_time >= %s - interval '6 hours'
+               AND NOT EXISTS (
+                 SELECT 1 FROM alerts a
+                  WHERE a.patient_id = m.patient_id
+                    AND a.type = 'MISSED_DOSE'
+                    AND a.created_at > ma.scheduled_time
+               )
+        """, (now_utc, now_utc))
+        rows = cur.fetchall()
+
+        for _ad_id, _med_id, pid, is_critical, tz, sched in rows:
+            sev = "HIGH" if is_critical else "MEDIUM"
+            msg = f"Missed medication dose scheduled at {sched.isoformat()}."
+            cur.execute("""
+                INSERT INTO alerts (patient_id, type, severity, message)
+                VALUES (%s,'MISSED_DOSE',%s,%s)
+            """, (pid, sev, msg))
+            escalations += 1
+            sms_sent += _send_med_sms(pid, f"Missed dose: please check in. Scheduled at local time.")
+
+    logging.info(f"[escalate_missed] escalations={escalations} sms_sent={sms_sent}")
+    return {"ok": True, "escalations": escalations, "sms_sent": sms_sent}
