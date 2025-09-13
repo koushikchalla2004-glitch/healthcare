@@ -430,3 +430,19 @@ def fitbit_sync_all(
             failed.append({"patient_id": pid, "error": str(e)})
 
     return {"ok": True, "processed": processed, "failed": failed}
+
+class MedicationIn(BaseModel):
+    patient_id: str
+    drug_name: str
+    dose: str | None = None
+    freq: str = "daily"
+    times_local: List[str]       # ["09:00","21:00"]
+    timezone: str = "America/Chicago"
+    start_date: date
+    end_date: date | None = None
+    is_ritical: bool = False
+
+class MedAckIn(BaseModel):
+    scheduled_time: datetime | None = None   # if omitted, ack most recent pending
+    source: str = "app"
+
