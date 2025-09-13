@@ -113,7 +113,7 @@ def _ensure_fitbit_tokens(patient_id: str):
 # =========
 # FastAPI
 # =========
-app = FastAPI(title="Health Readmit API", version="0.6.1")
+app = FastAPI(title="Health Readmit API", version="0.7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
@@ -132,6 +132,7 @@ class PatientIn(BaseModel):
     sex_at_birth: Optional[str] = None
     caregiver_phone: Optional[str] = None
     patient_phone: Optional[str] = None
+    timezone: Optional[str] = None  # NEW (defaults applied if None)
 
 class Vital(BaseModel):
     ts: datetime
@@ -157,13 +158,23 @@ class SourceLink(BaseModel):
     provider: str          # e.g., "fitbit"
     external_user_id: str  # provider user id
 
+# ---- Option C defaults ----
+DEFAULT_TIMESETS = {
+  "qd": ["09:00"],
+  "daily": ["09:00"],
+  "od": ["09:00"],
+  "bid": ["09:00", "21:00"],
+  "tid": ["08:00", "14:00", "20:00"],
+  "qid": ["08:00", "12:00", "16:00", "20:00"],
+}
+
 class MedicationIn(BaseModel):
     patient_id: str
     drug_name: str
     dose: str | None = None
     freq: str = "daily"
-    times_local: List[str]       # ["09:00","21:00"]
-    timezone: str = "America/Chicago"
+    times_local: List[str] | None = None    # OPTIONAL now
+    timezone: str | None = None             # OPTIONAL now
     start_date: date
     end_date: date | None = None
     is_critical: bool = False
@@ -196,9 +207,16 @@ def _today_scheduled_utc(tz: str, times_local: List[str], on_date: date) -> List
     z = ZoneInfo(tz)
     out = []
     for t in times_local:
-        hh, mm = map(int, t.split(":"))
-        dt_local = datetime(on_date.year, on_date.month, on_date.day, hh, mm, tzinfo=z)
-        out.append(dt_local.astimezone(ZoneInfo("UTC")))
+        try:
+            parts = t.split(":")
+            if len(parts) < 2:
+                raise ValueError("bad format, expected HH:MM")
+            hh, mm = int(parts[0]), int(parts[1])
+            dt_local = datetime(on_date.year, on_date.month, on_date.day, hh, mm, tzinfo=z)
+            out.append(dt_local.astimezone(ZoneInfo("UTC")))
+        except Exception as e:
+            logging.warning(f"Skipping bad times_local '{t}' (tz={tz}): {e}")
+            continue
     return out
 
 def _send_med_sms(patient_id: str, msg: str) -> int:
@@ -223,6 +241,29 @@ def as_native_json(v):
     except Exception:
         return v
 
+def _normalize_times(times: Optional[List[str]], freq: str) -> List[str]:
+    """Return a cleaned list of HH:MM times; if empty/invalid, use defaults from freq."""
+    cand = times if isinstance(times, list) else None
+    if not cand or not any(isinstance(x, str) for x in cand):
+        return DEFAULT_TIMESETS.get(freq.lower(), ["09:00"])
+    cleaned: List[str] = []
+    for t in cand:
+        try:
+            parts = t.split(":")
+            if len(parts) < 2: raise ValueError("bad format")
+            hh, mm = int(parts[0]), int(parts[1])
+            if not (0 <= hh <= 23 and 0 <= mm <= 59): raise ValueError("range")
+            cleaned.append(f"{hh:02d}:{mm:02d}")
+        except Exception:
+            logging.warning(f"Skipping invalid time '{t}' in times_local; using defaults if none valid.")
+    return cleaned if cleaned else DEFAULT_TIMESETS.get(freq.lower(), ["09:00"])
+
+def _patient_timezone(patient_id: str) -> str:
+    with conn.cursor() as cur:
+        cur.execute("SELECT timezone FROM patients WHERE id=%s", (patient_id,))
+        row = cur.fetchone()
+    return (row[0] if row and row[0] else "America/Chicago")
+
 
 # =======
 # Routes
@@ -240,12 +281,13 @@ def healthz():
 @app.post("/v1/patients")
 def create_patient(p: PatientIn):
     try:
+        tz = p.timezone or "America/Chicago"
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO patients (name, dob, sex_at_birth, caregiver_phone, patient_phone)
-                VALUES (%s,%s,%s,%s,%s)
+                INSERT INTO patients (name, dob, sex_at_birth, caregiver_phone, patient_phone, timezone)
+                VALUES (%s,%s,%s,%s,%s,%s)
                 RETURNING id
-            """, (p.name, p.dob, p.sex_at_birth, p.caregiver_phone, p.patient_phone))
+            """, (p.name, p.dob, p.sex_at_birth, p.caregiver_phone, p.patient_phone, tz))
             (pid,) = cur.fetchone()
         return {"ok": True, "id": str(pid)}
     except Exception as e:
@@ -500,20 +542,24 @@ def fitbit_sync_all(
     return {"ok": True, "processed": processed, "failed": failed}
 
 
-# -------- Medications: create/list/ack + reminder cron --------
+# -------- Medications: create/list/ack + reminder cron (Option C defaults) --------
 @app.post("/v1/meds")
 def create_med(m: MedicationIn):
     try:
+        # Defaults from patient/timezone and freq
+        tz = m.timezone or _patient_timezone(m.patient_id)
+        times = _normalize_times(m.times_local, m.freq)
+
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO medications
                 (patient_id, drug_name, dose, freq, times_local, timezone, start_date, end_date, is_critical)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 RETURNING id
-            """, (m.patient_id, m.drug_name, m.dose, m.freq, json.dumps(m.times_local),
-                  m.timezone, m.start_date, m.end_date, m.is_critical))
+            """, (m.patient_id, m.drug_name, m.dose, m.freq,
+                  json.dumps(times), tz, m.start_date, m.end_date, m.is_critical))
             (mid,) = cur.fetchone()
-        return {"ok": True, "medication_id": str(mid)}
+        return {"ok": True, "medication_id": str(mid), "times_local": times, "timezone": tz}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
@@ -535,7 +581,7 @@ def list_meds(patient_id: str):
                 "drug_name": r[1],
                 "dose": r[2],
                 "freq": r[3],
-                "times_local": as_native_json(r[4]),  # <-- fixed
+                "times_local": as_native_json(r[4]),
                 "timezone": r[5],
                 "start_date": r[6].isoformat(),
                 "end_date": r[7].isoformat() if r[7] else None,
@@ -602,7 +648,7 @@ def meds_remind_now(x_admin_key: str | None = Header(default=None)):
         meds = cur.fetchall()
 
         for mid, pid, times_json, tz, sdate, edate in meds:
-            times = as_native_json(times_json) or []   # <-- fixed
+            times = as_native_json(times_json) or []
             if not isinstance(times, list):
                 continue
             for sched_utc in _today_scheduled_utc(tz, times, datetime.utcnow().date()):
