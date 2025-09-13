@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from twilio.rest import Client
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 # ======================
@@ -62,12 +62,37 @@ def _token_headers():
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
+# ===== Timezone helpers =====
+TZ_FIXES = {
+    "America/Austin": "America/Chicago",
+    "Austin": "America/Chicago",
+    "CST": "America/Chicago",
+    "PST": "America/Los_Angeles",
+    "EST": "America/New_York",
+    "MST": "America/Denver",
+    "IST": "Asia/Kolkata",
+    "US/Central": "America/Chicago",
+}
+
+def canonical_tz(tz: str | None) -> str:
+    """Return a safe IANA timezone (fallback to UTC)."""
+    if not tz:
+        return "America/Chicago"
+    t = TZ_FIXES.get(tz.strip(), tz.strip())
+    try:
+        ZoneInfo(t)
+        return t
+    except ZoneInfoNotFoundError:
+        logging.warning(f"Unknown timezone '{tz}', falling back to UTC")
+        return "UTC"
+
 def _fitbit_user_timezone(access_token: str) -> str:
     hdr = {"Authorization": f"Bearer {access_token}"}
     try:
         r = requests.get(f"{FITBIT_API}/1/user/-/profile.json", headers=hdr, timeout=15)
         if r.status_code == 200:
-            return r.json().get("user", {}).get("timezone", "UTC") or "UTC"
+            tz = r.json().get("user", {}).get("timezone", "UTC") or "UTC"
+            return canonical_tz(tz)
     except Exception:
         pass
     return "UTC"
@@ -113,7 +138,7 @@ def _ensure_fitbit_tokens(patient_id: str):
 # =========
 # FastAPI
 # =========
-app = FastAPI(title="Health Readmit API", version="0.7.0")
+app = FastAPI(title="Health Readmit API", version="0.8.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
@@ -132,7 +157,7 @@ class PatientIn(BaseModel):
     sex_at_birth: Optional[str] = None
     caregiver_phone: Optional[str] = None
     patient_phone: Optional[str] = None
-    timezone: Optional[str] = None  # NEW (defaults applied if None)
+    timezone: Optional[str] = None  # default applied if None
 
 class Vital(BaseModel):
     ts: datetime
@@ -204,7 +229,7 @@ def _insert_or_update_vital(cur, patient_id: str, ts: datetime,
     """, (patient_id, ts, hr, steps, spo2, sbp, dbp, temp_c))
 
 def _today_scheduled_utc(tz: str, times_local: List[str], on_date: date) -> List[datetime]:
-    z = ZoneInfo(tz)
+    z = ZoneInfo(canonical_tz(tz))
     out = []
     for t in times_local:
         try:
@@ -262,7 +287,7 @@ def _patient_timezone(patient_id: str) -> str:
     with conn.cursor() as cur:
         cur.execute("SELECT timezone FROM patients WHERE id=%s", (patient_id,))
         row = cur.fetchone()
-    return (row[0] if row and row[0] else "America/Chicago")
+    return canonical_tz(row[0] if row and row[0] else None)
 
 
 # =======
@@ -281,7 +306,7 @@ def healthz():
 @app.post("/v1/patients")
 def create_patient(p: PatientIn):
     try:
-        tz = p.timezone or "America/Chicago"
+        tz = canonical_tz(p.timezone or "America/Chicago")
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO patients (name, dob, sex_at_birth, caregiver_phone, patient_phone, timezone)
@@ -547,7 +572,7 @@ def fitbit_sync_all(
 def create_med(m: MedicationIn):
     try:
         # Defaults from patient/timezone and freq
-        tz = m.timezone or _patient_timezone(m.patient_id)
+        tz = canonical_tz(m.timezone or _patient_timezone(m.patient_id))
         times = _normalize_times(m.times_local, m.freq)
 
         with conn.cursor() as cur:
@@ -633,7 +658,7 @@ def ack_med(med_id: str, body: MedAckIn):
 def meds_remind_now(x_admin_key: str | None = Header(default=None)):
     _check_admin_key(x_admin_key)
 
-    now_utc = datetime.now(ZoneInfo("UTC"))
+    now_utc = datetime.now(ZoneInfo("UTC"))  # aware
     window_minutes = 5  # align with cron frequency
     sent_total = 0
     created_total = 0
@@ -651,7 +676,10 @@ def meds_remind_now(x_admin_key: str | None = Header(default=None)):
             times = as_native_json(times_json) or []
             if not isinstance(times, list):
                 continue
-            for sched_utc in _today_scheduled_utc(tz, times, datetime.utcnow().date()):
+            # compute schedule for the patient's LOCAL day
+            tz_can = canonical_tz(tz)
+            local_today = datetime.now(ZoneInfo(tz_can)).date()
+            for sched_utc in _today_scheduled_utc(tz_can, times, local_today):
                 delta = abs((now_utc - sched_utc).total_seconds()) / 60.0
                 if delta <= window_minutes:
                     # create pending adherence row if not exists (prevents duplicate SMS)
