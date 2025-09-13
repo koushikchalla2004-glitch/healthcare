@@ -1,11 +1,11 @@
-import os, base64, json, time, logging
+import os, base64, json, time, logging, re, io, mimetypes
 from datetime import datetime, date
 from typing import Optional, List
 from urllib.parse import urlencode
 
 import psycopg  # v3
 import requests
-from fastapi import FastAPI, HTTPException, Query, Header
+from fastapi import FastAPI, HTTPException, Query, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
@@ -138,7 +138,7 @@ def _ensure_fitbit_tokens(patient_id: str):
 # =========
 # FastAPI
 # =========
-app = FastAPI(title="Health Readmit API", version="0.9.0")
+app = FastAPI(title="Health Readmit API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
@@ -188,7 +188,7 @@ class SourceLink(BaseModel):
     provider: str          # e.g., "fitbit"
     external_user_id: str  # provider user id
 
-# ---- Option C defaults ----
+# ---- defaults for meds ----
 DEFAULT_TIMESETS = {
   "qd": ["09:00"],
   "daily": ["09:00"],
@@ -203,8 +203,8 @@ class MedicationIn(BaseModel):
     drug_name: str
     dose: str | None = None
     freq: str = "daily"
-    times_local: List[str] | None = None    # OPTIONAL now
-    timezone: str | None = None             # OPTIONAL now
+    times_local: List[str] | None = None    # OPTIONAL
+    timezone: str | None = None             # OPTIONAL
     start_date: date
     end_date: date | None = None
     is_critical: bool = False
@@ -215,7 +215,117 @@ class MedAckIn(BaseModel):
 
 
 # =========
-# Helpers
+# Regex helpers for unstructured text
+# =========
+ICD10_RE = re.compile(r"\b([A-TV-Z][0-9]{2}(?:\.[0-9A-Za-z]{1,4})?)\b")
+
+# drug + dose + (optional) route + the rest as sig
+MED_LINE = re.compile(
+    r"""(?ix)
+    ^\s*
+    (?P<name>[A-Za-z][\w\-/\s]{1,60}?)        # drug name
+    [\s,]+
+    (?P<dose>\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|units|iu))  # dose/strength
+    (?:[,\s;]*(?P<route>po|oral|iv|im|sc|sl|topical|inh))?   # optional route
+    (?P<sig>.*)$                                   # remainder = sig
+    """
+)
+
+SIG_MAP = {
+    "qd": "daily", "od": "daily", "daily": "daily", "once daily": "daily",
+    "bid": "bid", "twice daily": "bid", "2xd": "bid",
+    "tid": "tid", "3xd": "tid",
+    "qid": "qid", "4xd": "qid",
+    "hs": "hs", "nocte": "hs", "bedtime": "hs",
+    "mane": "morning", "morning": "morning",
+    "noon": "noon", "afternoon": "noon",
+    "evening": "evening", "night": "night",
+}
+
+def _parse_text_for_dx(text: str) -> List[str]:
+    return sorted(set(ICD10_RE.findall(text or "")))
+
+def _infer_times_from_sig(sig: str | None, freq_fallback: str = "daily") -> List[str] | None:
+    if not sig:
+        return None
+    s = sig.lower().strip()
+
+    # explicit clock times (8am, 9:00 pm, 20:00)
+    tmatches = re.findall(r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b', s)
+    times: List[str] = []
+    for hh, mm, ap in tmatches:
+        h = int(hh)
+        m = int(mm or 0)
+        if ap:
+            ap = ap.lower()
+            if ap == "pm" and h < 12: h += 12
+            if ap == "am" and h == 12: h = 0
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            times.append(f"{h:02d}:{m:02d}")
+    if times:
+        return sorted(list(set(times)))
+
+    # 1-0-1 style (morning-noon-night)
+    m = re.search(r'\b([01])\s*-\s*([01])\s*-\s*([01])\b', s)
+    if m:
+        morning, noon, night = (m.group(i) == "1" for i in (1,2,3))
+        t = []
+        if morning: t.append("09:00")
+        if noon:    t.append("13:00")
+        if night:   t.append("21:00")
+        return t or None
+
+    # qXh
+    mq = re.search(r'\bq\s*([46812]|24)\s*(?:h|hr|hrs|hours)\b', s)
+    if mq:
+        h = int(mq.group(1))
+        if h == 24: return ["09:00"]
+        if h == 12: return ["09:00", "21:00"]
+        if h == 8:  return ["06:00", "14:00", "22:00"]
+        if h == 6:  return ["06:00", "12:00", "18:00", "00:00"]
+        if h == 4:  return ["06:00", "10:00", "14:00", "18:00", "22:00", "02:00"]
+
+    # hints
+    if any(tok in s for tok in ("hs","nocte","bedtime")): return ["22:00"]
+    if any(tok in s for tok in ("mane","morning")):       return ["09:00"]
+    if "noon" in s or "afternoon" in s:                   return ["13:00"]
+    if "evening" in s:                                    return ["19:00"]
+    if "night" in s:                                      return ["21:00"]
+
+    # freq
+    if "tid" in s or "3xd" in s:  return ["08:00","14:00","20:00"]
+    if "qid" in s or "4xd" in s:  return ["08:00","12:00","16:00","20:00"]
+    if "bid" in s or "twice daily" in s or "2xd" in s: return ["09:00","21:00"]
+    if any(k in s for k in ("qd","od","once daily","daily")): return ["09:00"]
+
+    return None
+
+def _extract_meds_unstructured(text: str) -> List[dict]:
+    meds = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or len(line) < 3:
+            continue
+        m = MED_LINE.match(line)
+        if not m:
+            continue
+        name = re.sub(r'\s+', ' ', m.group("name")).strip(" -")
+        dose = (m.group("dose") or "").strip()
+        route = (m.group("route") or "").lower()
+        sig = (m.group("sig") or "").strip()
+        # normalize freq from tokens in sig
+        freq = None
+        for k, v in SIG_MAP.items():
+            if k in sig:
+                freq = "daily" if v in ("morning","noon","evening","night","hs") else v
+                break
+        freq = freq or "daily"
+        meds.append({"drug_name": name, "dose": dose, "route": route, "sig": sig, "freq": freq})
+    return meds
+
+
+# =========
+# Shared helpers
 # =========
 def _insert_or_update_vital(cur, patient_id: str, ts: datetime,
                             hr: int | None = None, steps: int | None = None,
@@ -375,6 +485,7 @@ def link_source(patient_id: str, body: SourceLink):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
+# -------- Vitals & alerts --------
 @app.post("/v1/vitals")
 def ingest_vitals(batch: VitalsBatch):
     # Sanity filter
@@ -388,7 +499,6 @@ def ingest_vitals(batch: VitalsBatch):
 
     try:
         with conn.cursor() as cur:
-            # insert vitals
             cur.executemany("""
                 INSERT INTO vitals (patient_id, ts, hr, spo2, steps, sbp, dbp, temp_c)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
@@ -397,13 +507,11 @@ def ingest_vitals(batch: VitalsBatch):
                 batch.patient_id, s.ts, s.hr, s.spo2, s.steps, s.sbp, s.dbp, s.temp_c
             ) for s in clean])
 
-            # caregiver phone
             caregiver_phone = None
             cur.execute("SELECT caregiver_phone FROM patients WHERE id=%s", (batch.patient_id,))
             r = cur.fetchone()
             if r: caregiver_phone = r[0]
 
-            # alert candidates (latest sample)
             last = clean[-1]
             candidates = []
             if last.spo2 is not None and last.spo2 < 90:
@@ -413,7 +521,6 @@ def ingest_vitals(batch: VitalsBatch):
 
             alerts_created, sms_sent = 0, 0
             for t, se, msg in candidates:
-                # cooldown 15 min per (patient,type)
                 cur.execute("""
                     SELECT COUNT(*) FROM alerts
                      WHERE patient_id=%s AND type=%s
@@ -610,7 +717,7 @@ def fitbit_sync_all(
     return {"ok": True, "processed": processed, "failed": failed}
 
 
-# -------- Medications: create/list/ack + reminder cron (Option C defaults) --------
+# -------- Medications: create/list/ack + reminder cron --------
 @app.post("/v1/meds")
 def create_med(m: MedicationIn):
     try:
@@ -754,7 +861,6 @@ def meds_remind_now(
             for sched_utc in _today_scheduled_utc(tz_can, times, local_today):
                 delta = abs((now_utc - sched_utc).total_seconds()) / 60.0
                 if delta <= window_minutes:
-                    # create pending adherence row if not exists (prevents duplicate SMS)
                     cur.execute("""
                         INSERT INTO med_adherence (medication_id, scheduled_time, taken)
                         VALUES (%s,%s,false)
@@ -808,3 +914,110 @@ def meds_escalate_missed(x_admin_key: str | None = Header(default=None)):
 
     logging.info(f"[escalate_missed] escalations={escalations} sms_sent={sms_sent}")
     return {"ok": True, "escalations": escalations, "sms_sent": sms_sent}
+
+
+# ===== Unstructured uploads =====
+def _read_plain_text_from_upload(file: UploadFile) -> str:
+    data = file.file.read()
+    try:
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+@app.post("/v1/docs/discharge_text")
+async def upload_discharge_text(
+    patient_id: str = Form(...),
+    file: UploadFile | None = File(None),
+    text: str | None = Form(None)
+):
+    """
+    Accepts unstructured discharge summary (either .txt file or 'text' form field)
+    and extracts ICD-10 codes into `diagnoses` (+records a document row).
+    """
+    # Get raw text
+    if text and text.strip():
+        raw_text = text
+    elif file:
+        if not (file.filename or "").lower().endswith(".txt"):
+            raise HTTPException(status_code=400, detail="Please upload a .txt file or use the 'text' field.")
+        raw_text = _read_plain_text_from_upload(file)
+    else:
+        raise HTTPException(status_code=400, detail="Provide a .txt file or 'text' form field.")
+
+    # record document
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO documents (patient_id, filename, content_type, status)
+                VALUES (%s,%s,%s,'done') RETURNING id
+            """, (patient_id, (file.filename if file else "discharge_text.txt"), "text/plain"))
+            (doc_id,) = cur.fetchone()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error creating doc: {e}")
+
+    dx_codes = _parse_text_for_dx(raw_text)
+    dx_created = 0
+    try:
+        with conn.cursor() as cur:
+            for code in dx_codes:
+                cur.execute("""
+                    INSERT INTO diagnoses (patient_id, source_document_id, icd10, description)
+                    VALUES (%s,%s,%s,NULL)
+                """, (patient_id, doc_id, code))
+                dx_created += 1
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error saving diagnoses: {e}")
+
+    return {"ok": True, "document_id": str(doc_id), "diagnoses_created": dx_created}
+
+@app.post("/v1/docs/meds_text")
+async def upload_meds_text(
+    patient_id: str = Form(...),
+    file: UploadFile | None = File(None),
+    text: str | None = Form(None),
+):
+    """
+    Accepts free-form pharmacy text: either a .txt file or a 'text' form field.
+    Parses drug name + dose + sig (e.g., 1-0-1, q12h, hs, bid) and creates medications.
+    """
+    # get raw text
+    if text and text.strip():
+        raw_text = text
+    elif file:
+        if not (file.filename or "").lower().endswith(".txt"):
+            raise HTTPException(status_code=400, detail="Please upload a .txt file or pass 'text' field.")
+        raw_text = _read_plain_text_from_upload(file)
+    else:
+        raise HTTPException(status_code=400, detail="Provide a .txt file or 'text' form field.")
+
+    meds = _extract_meds_unstructured(raw_text)
+    if not meds:
+        return {"ok": True, "medications_created": 0, "note": "No medication patterns recognized."}
+
+    tz = _patient_timezone(patient_id)
+    created = 0
+    try:
+        with conn.cursor() as cur:
+            # record doc row (provenance)
+            cur.execute("""
+                INSERT INTO documents (patient_id, filename, content_type, status)
+                VALUES (%s,%s,%s,'done') RETURNING id
+            """, (patient_id, (file.filename if file else "pharmacy_text.txt"), "text/plain"))
+            (doc_id,) = cur.fetchone()
+
+            for m in meds[:25]:  # cap to avoid noisy bulk inserts
+                inferred = _infer_times_from_sig(m["sig"], m["freq"])
+                times = inferred or _normalize_times(None, m["freq"])
+                cur.execute("""
+                    INSERT INTO medications
+                    (patient_id, drug_name, dose, freq, times_local, timezone, start_date, end_date, is_critical)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (
+                    patient_id, m["drug_name"], m["dose"], m["freq"],
+                    json.dumps(times), tz, date.today(), None, False
+                ))
+                created += 1
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Text ingest error: {e}")
+
+    return {"ok": True, "medications_created": created}
