@@ -168,3 +168,31 @@ def list_alerts(patient_id: str):
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+from datetime import datetime, date  # add date import at top
+
+from pydantic import BaseModel
+
+class PatientIn(BaseModel):
+    name: str
+    dob: date
+    sex_at_birth: str | None = None
+    caregiver_phone: str | None = None
+
+@app.post("/v1/patients")
+def create_patient(p: PatientIn):
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO patients (name, dob, sex_at_birth, caregiver_phone)
+                VALUES (%s,%s,%s,%s)
+                RETURNING id
+                """,
+                (p.name, p.dob, p.sex_at_birth, p.caregiver_phone),
+            )
+            (pid,) = cur.fetchone()
+        return {"ok": True, "id": str(pid)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
