@@ -1,29 +1,70 @@
 import os
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-import psycopg  # psycopg v3 (binary)
-from psycopg import sql
+import psycopg  # psycopg v3
+from twilio.rest import Client
+from fastapi.middleware.cors import CORSMiddleware
 
 
-# --- DB connection ---
+# -----------------------
+# Config & DB connection
+# -----------------------
 DB_URL = os.getenv("DATABASE_URL")
 if not DB_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-# Single connection for now (Render free tier runs one worker by default).
-# If you later add more workers/threads, switch to psycopg_pool ConnectionPool.
+# Tip (Neon pooled URL): add &channel_binding=prefer in the URL if needed.
 conn = psycopg.connect(DB_URL, autocommit=True)
 
+# Twilio (optional; SMS sent only if these are set and a caregiver phone exists)
+TWILIO_SID = os.getenv("TWILIO_SID")
+TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
+TWILIO_FROM = os.getenv("TWILIO_FROM")
 
-# --- FastAPI app ---
-app = FastAPI(title="Health Readmit API", version="0.1.1")
+
+def send_sms_safe(to: Optional[str], body: str) -> bool:
+    """Send SMS if Twilio creds + 'to' are present. Returns True if queued."""
+    if not (TWILIO_SID and TWILIO_TOKEN and TWILIO_FROM and to):
+        return False
+    try:
+        Client(TWILIO_SID, TWILIO_TOKEN).messages.create(
+            to=to, from_=TWILIO_FROM, body=body
+        )
+        return True
+    except Exception as e:
+        print(f"Twilio error: {e}")
+        return False
 
 
-# --- Models ---
+# -----------------------
+# FastAPI app
+# -----------------------
+app = FastAPI(title="Health Readmit API", version="0.2.0")
+
+# Allow simple frontends to call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# -----------------------
+# Pydantic models
+# -----------------------
+class PatientIn(BaseModel):
+    name: str
+    dob: date
+    sex_at_birth: Optional[str] = None
+    caregiver_phone: Optional[str] = None
+
+
 class Vital(BaseModel):
     ts: datetime
     hr: Optional[int] = None
@@ -47,7 +88,9 @@ class AlertIn(BaseModel):
     message: str
 
 
-# --- Routes ---
+# -----------------------
+# Routes
+# -----------------------
 @app.get("/healthz")
 def healthz():
     try:
@@ -59,10 +102,28 @@ def healthz():
         raise HTTPException(status_code=500, detail=f"DB health check failed: {e}")
 
 
+@app.post("/v1/patients")
+def create_patient(p: PatientIn):
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO patients (name, dob, sex_at_birth, caregiver_phone)
+                VALUES (%s,%s,%s,%s)
+                RETURNING id
+                """,
+                (p.name, p.dob, p.sex_at_birth, p.caregiver_phone),
+            )
+            (pid,) = cur.fetchone()
+        return {"ok": True, "id": str(pid)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+
 @app.post("/v1/vitals")
 def ingest_vitals(batch: VitalsBatch):
     # Basic sanity filtering
-    clean = []
+    clean: List[Vital] = []
     for s in batch.samples:
         if s.hr is not None and (s.hr < 25 or s.hr > 220):
             continue
@@ -89,35 +150,49 @@ def ingest_vitals(batch: VitalsBatch):
             ]
             cur.executemany(insert_sql, params)
 
-            # Simple alert rules on the latest sample
+            # Caregiver phone (if any)
+            caregiver_phone = None
+            cur.execute("SELECT caregiver_phone FROM patients WHERE id=%s", (batch.patient_id,))
+            row = cur.fetchone()
+            if row:
+                caregiver_phone = row[0]
+
+            # Candidate alerts from the most recent sample
             last = clean[-1]
-            alerts = []
+            candidates: List[tuple[str, str, str]] = []
             if last.spo2 is not None and last.spo2 < 90:
-                alerts.append((
-                    batch.patient_id,
-                    "SPO2_LOW",
-                    "HIGH",
-                    f"SpO2 {last.spo2}% below 90 at {last.ts.isoformat()}"
-                ))
+                candidates.append(("SPO2_LOW", "HIGH", f"SpO2 {last.spo2}% below 90 at {last.ts.isoformat()}"))
             if last.hr is not None and (last.hr < 40 or last.hr > 135):
-                alerts.append((
-                    batch.patient_id,
-                    "HR_ABNORMAL",
-                    "HIGH",
-                    f"HR {last.hr} abnormal at {last.ts.isoformat()}"
-                ))
+                candidates.append(("HR_ABNORMAL", "HIGH", f"HR {last.hr} abnormal at {last.ts.isoformat()}"))
 
-            if alerts:
-                cur.executemany(
+            alerts_created = 0
+            sms_sent = 0
+
+            for t, se, msg in candidates:
+                # 15-minute cooldown per (patient, type)
+                cur.execute(
                     """
-                    INSERT INTO alerts (patient_id, type, severity, message)
-                    VALUES (%s,%s,%s,%s)
+                    SELECT COUNT(*) FROM alerts
+                    WHERE patient_id=%s AND type=%s
+                      AND created_at > now() - interval '15 minutes'
                     """,
-                    alerts
+                    (batch.patient_id, t),
                 )
-                # TODO: call Twilio here (cooldown recommended)
+                recent = cur.fetchone()[0] > 0
 
-        return {"ok": True, "inserted": len(clean), "alerts_created": len(alerts)}
+                # Insert alert row
+                cur.execute(
+                    "INSERT INTO alerts (patient_id, type, severity, message) VALUES (%s,%s,%s,%s)",
+                    (batch.patient_id, t, se, msg),
+                )
+                alerts_created += 1
+
+                # Notify caregiver if HIGH and not recently alerted
+                if se == "HIGH" and not recent:
+                    if send_sms_safe(caregiver_phone, f"[ALERT] {msg}"):
+                        sms_sent += 1
+
+        return {"ok": True, "inserted": len(clean), "alerts_created": alerts_created, "sms_sent": sms_sent}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
@@ -168,31 +243,3 @@ def list_alerts(patient_id: str):
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
-
-from datetime import datetime, date  # add date import at top
-
-from pydantic import BaseModel
-
-class PatientIn(BaseModel):
-    name: str
-    dob: date
-    sex_at_birth: str | None = None
-    caregiver_phone: str | None = None
-
-@app.post("/v1/patients")
-def create_patient(p: PatientIn):
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO patients (name, dob, sex_at_birth, caregiver_phone)
-                VALUES (%s,%s,%s,%s)
-                RETURNING id
-                """,
-                (p.name, p.dob, p.sex_at_birth, p.caregiver_phone),
-            )
-            (pid,) = cur.fetchone()
-        return {"ok": True, "id": str(pid)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB error: {e}")
-
