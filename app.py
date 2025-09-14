@@ -1,17 +1,19 @@
 import os, base64, json, time, logging, re, io, mimetypes, csv, math, pickle
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional, List
 from urllib.parse import urlencode
 
 import numpy as np
 import psycopg  # v3
 import requests
-from fastapi import FastAPI, HTTPException, Query, Header, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, Header, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from twilio.rest import Client
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from jose import jwt, JWTError
+from passlib.hash import bcrypt
 
 # ======================
 # Config & DB connection
@@ -36,11 +38,37 @@ def send_sms_safe(to: Optional[str], body: str) -> bool:
         logging.warning(f"Twilio error: {e}")
         return False
 
-# Admin key to protect cronable endpoints
+# Admin key for cron/privileged ops (reuse your CRON_KEY)
 CRON_KEY = os.getenv("CRON_KEY")
 def _check_admin_key(x_admin_key: str | None):
     if CRON_KEY and x_admin_key != CRON_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ===== Auth (JWT) =====
+AUTH_SECRET = os.getenv("AUTH_SECRET", "dev-secret-change-me")
+ACCESS_TOKEN_MIN = int(os.getenv("ACCESS_TOKEN_MIN", "10080"))  # 7 days
+
+def _hash_pw(pw: str) -> str: return bcrypt.hash(pw)
+def _check_pw(pw: str, ph: str) -> bool:
+    try: return bcrypt.verify(pw, ph)
+    except Exception: return False
+
+def _make_token(sub: str, role: str) -> str:
+    exp = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_MIN)
+    return jwt.encode({"sub": sub, "role": role, "exp": exp}, AUTH_SECRET, algorithm="HS256")
+
+def _decode_token(token: str) -> dict:
+    return jwt.decode(token, AUTH_SECRET, algorithms=["HS256"])
+
+def _current_user(authorization: str | None = Header(default=None)) -> dict:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = _decode_token(token)
+        return {"user_id": payload["sub"], "role": payload.get("role", "patient")}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 # ===== Google Document AI (OCR) init =====
 GCP_DOCAI_PROJECT = os.getenv("GCP_DOCAI_PROJECT")
@@ -70,7 +98,7 @@ except Exception as e:
 # =========
 # FastAPI
 # =========
-app = FastAPI(title="Health Readmit API", version="1.3.0")
+app = FastAPI(title="Health Readmit API", version="1.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -155,8 +183,7 @@ def canonical_tz(tz: str | None) -> str:
     try:
         ZoneInfo(t); return t
     except ZoneInfoNotFoundError:
-        logging.warning(f"Unknown timezone '{tz}', falling back to UTC")
-        return "UTC"
+        logging.warning(f"Unknown timezone '{tz}', falling back to UTC"); return "UTC"
 
 def _patient_timezone(patient_id: str) -> str:
     with conn.cursor() as cur:
@@ -213,8 +240,7 @@ def _normalize_times(times: Optional[List[str]], freq: str) -> List[str]:
     for t in cand:
         try:
             hh, mm = [int(x) for x in t.split(":")[:2]]
-            if 0 <= hh <= 23 and 0 <= mm <= 59:
-                cleaned.append(f"{hh:02d}:{mm:02d}")
+            if 0 <= hh <= 23 and 0 <= mm <= 59: cleaned.append(f"{hh:02d}:{mm:02d}")
         except Exception:
             continue
     return cleaned if cleaned else DEFAULT_TIMESETS.get(freq.lower(), ["09:00"])
@@ -252,7 +278,6 @@ def _parse_text_for_dx(text: str) -> List[str]:
 def _infer_times_from_sig(sig: str | None, freq_fallback: str = "daily") -> List[str] | None:
     if not sig: return None
     s = sig.lower().strip()
-
     tmatches = re.findall(r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b', s)
     times: List[str] = []
     for hh, mm, ap in tmatches:
@@ -260,10 +285,8 @@ def _infer_times_from_sig(sig: str | None, freq_fallback: str = "daily") -> List
         if ap:
             if ap.lower() == "pm" and h < 12: h += 12
             if ap.lower() == "am" and h == 12: h = 0
-        if 0 <= h <= 23 and 0 <= m <= 59:
-            times.append(f"{h:02d}:{m:02d}")
+        if 0 <= h <= 23 and 0 <= m <= 59: times.append(f"{h:02d}:{m:02d}")
     if times: return sorted(list(set(times)))
-
     m = re.search(r'\b([01])\s*-\s*([01])\s*-\s*([01])\b', s)
     if m:
         morning, noon, night = (m.group(i) == "1" for i in (1,2,3))
@@ -272,7 +295,6 @@ def _infer_times_from_sig(sig: str | None, freq_fallback: str = "daily") -> List
         if noon:    t.append("13:00")
         if night:   t.append("21:00")
         return t or None
-
     mq = re.search(r'\bq\s*([46812]|24)\s*(?:h|hr|hrs|hours)\b', s)
     if mq:
         h = int(mq.group(1))
@@ -281,18 +303,15 @@ def _infer_times_from_sig(sig: str | None, freq_fallback: str = "daily") -> List
         if h == 8:  return ["06:00", "14:00", "22:00"]
         if h == 6:  return ["06:00", "12:00", "18:00", "00:00"]
         if h == 4:  return ["06:00", "10:00", "14:00", "18:00", "22:00", "02:00"]
-
     if any(tok in s for tok in ("hs","nocte","bedtime")): return ["22:00"]
     if any(tok in s for tok in ("mane","morning")):       return ["09:00"]
     if "noon" in s or "afternoon" in s:                   return ["13:00"]
     if "evening" in s:                                    return ["19:00"]
     if "night" in s:                                      return ["21:00"]
-
     if "tid" in s or "3xd" in s:  return ["08:00","14:00","20:00"]
     if "qid" in s or "4xd" in s:  return ["08:00","12:00","16:00","20:00"]
     if "bid" in s or "twice daily" in s or "2xd" in s: return ["09:00","21:00"]
     if any(k in s for k in ("qd","od","once daily","daily")): return ["09:00"]
-
     return None
 
 def _extract_meds_unstructured(text: str) -> List[dict]:
@@ -334,6 +353,66 @@ def _read_text_from_upload(file: UploadFile) -> str:
         return data.decode("utf-8", errors="ignore")
     except Exception:
         return ""
+
+# =======
+# Routes: auth
+# =======
+class RegisterIn(BaseModel):
+    email: str
+    password: str
+    role: str = "patient"      # 'patient' or 'admin'
+    patient_id: Optional[str] = None
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+@app.post("/auth/register")
+def auth_register(body: RegisterIn, x_admin_key: str | None = Header(default=None)):
+    _check_admin_key(x_admin_key)  # require admin key to create users
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO users (email, password_hash, role) VALUES (%s,%s,%s) RETURNING id, role",
+                        (body.email.lower().strip(), _hash_pw(body.password), body.role))
+            uid, role = cur.fetchone()
+            if body.patient_id:
+                cur.execute("INSERT INTO user_patient (user_id, patient_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                            (uid, body.patient_id))
+        return {"ok": True, "user_id": str(uid), "role": role}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Register failed: {e}")
+
+@app.post("/auth/login", response_model=TokenOut)
+def auth_login(body: LoginIn):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, password_hash, role FROM users WHERE email=%s", (body.email.lower().strip(),))
+            row = cur.fetchone()
+        if not row or not _check_pw(body.password, row[1]):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        uid, role = str(row[0]), row[2]
+        token = _make_token(uid, role)
+        return {"access_token": token}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Login error: {e}")
+
+@app.get("/v1/me")
+def me(user=Depends(_current_user)):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT email, role FROM users WHERE id=%s", (user["user_id"],))
+            u = cur.fetchone()
+            cur.execute("SELECT patient_id FROM user_patient WHERE user_id=%s LIMIT 1", (user["user_id"],))
+            p = cur.fetchone()
+        return {"user_id": user["user_id"], "email": u[0], "role": u[1], "patient_id": (str(p[0]) if p else None)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"me error: {e}")
 
 # =======
 # Routes: patients
@@ -403,7 +482,7 @@ def link_source(patient_id: str, body: SourceLink):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-# -------- Vitals & alerts --------
+# -------- Vitals & alerts (unchanged from your live build) --------
 @app.post("/v1/vitals")
 def ingest_vitals(batch: VitalsBatch):
     clean = []
@@ -472,7 +551,7 @@ def list_alerts(patient_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-# -------- Fitbit OAuth + Sync --------
+# -------- Fitbit OAuth + Sync (unchanged) --------
 @app.get("/oauth/fitbit/start")
 def fitbit_start(patient_id: str = Query(..., description="UUID of patient")):
     if not (os.getenv("FITBIT_CLIENT_ID") and os.getenv("FITBIT_REDIRECT_URI")):
@@ -808,8 +887,8 @@ async def upload_meds_text(patient_id: str = Form(...),
         raise HTTPException(status_code=500, detail=f"Text/OCR ingest error: {e}")
     return {"ok": True, "medications_created": created}
 
-# ===== Readmission Risk (heuristic now; pluggable sklearn) =====
-RISK_MODEL_B64 = os.getenv("RISK_MODEL_B64")      # optional: base64 of sklearn model.pkl
+# ===== Readmission Risk =====
+RISK_MODEL_B64 = os.getenv("RISK_MODEL_B64")      # optional: base64(sklearn model.pkl)
 RISK_MODEL_VERSION = os.getenv("RISK_MODEL_VERSION", "heuristic_v1")
 _MODEL = None
 _MODEL_FEATURES = [
@@ -892,14 +971,12 @@ def risk_score(patient_id: str, store: bool = True):
         try:
             prob = float(model.predict_proba(x)[:,1][0])
         except Exception:
-            z = float(model.decision_function(x)[0])
-            prob = 1.0/(1.0+math.exp(-z))
+            z = float(model.decision_function(x)[0]); prob = 1.0/(1.0+math.exp(-z))
         score = max(0.0, min(1.0, prob))
         factors = {k: float(feats[k]) for k in _MODEL_FEATURES}
         model_ver = os.getenv("RISK_MODEL_VERSION", "sklearn_v1")
     else:
-        score, factors = _heuristic_risk(feats)
-        model_ver = "heuristic_v1"
+        score, factors = _heuristic_risk(feats); model_ver = "heuristic_v1"
     bucket = "low" if score < 0.33 else ("medium" if score < 0.66 else "high")
     if store:
         try:
