@@ -9,3 +9,5 @@ python-multipart==0.0.9
 google-cloud-documentai
 scikit-learn==1.5.1
 numpy==1.26.4
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
